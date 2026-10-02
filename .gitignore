@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 打包产物（按需构建，不进仓库）
+dist-onedir/
+build/
+*.spec.bak
+dsh-pet-dist/
+dsh-pet-portable.zip
+
+# 运行期与本地状态
+pet-host.log
+*.log
+settings.lock
+.pending-chat-image.jpg
+chat-request-*.json
+chat-stream-*.jsonl
+
+# 诊断
+dsh-provider.log
+dsh-region.log
+_bodyprobe_*.png
+_bbprobe.png
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.bak
+*.bak-*

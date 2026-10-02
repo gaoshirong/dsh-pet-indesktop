@@ -1,0 +1,22 @@
+# 宿主包补丁层：**只**插入 launcher 行。
+#
+# ⚠️ 这里不得插入声明了 dsh.client 的插件行（例如 @local/dsh-pet）。
+# 实测（2026-10-02）：把 dsh-pet-ui 加进本包的 insert 会导致 **DSH 启动即崩**。
+# dsh-client-modules 会对客户端插件按"行解析到的 package.json 的 name"归属包并做
+# 硬校验，同一个包被多处解析即被拒绝，required 插件 modules 不激活 → 崩。
+# 本包只做进程托管；客户端插件必须另行、单独地接入。
+#
+# name 用相对路径 './index.js'：loader 的 anchorInsertedPluginNames 会把 insert 里的
+# 相对路径按"补丁文件所在目录"锚定成绝对 file URL。
+#
+# ⚠️ config 里**刻意不写任何绝对路径**：桌宠的安装位置由
+# `~/.dsh/dsh-pet-install.json`（install/install.ps1 写入）与发行包内的
+# 自洽布局决定，见 launcher.js 的 resolveInstallPaths()。
+# 这里若写死开发机路径，别人装上以后桌宠会去 D:\DSH-Pet 找程序而启动失败。
+- insert:
+    - id: dsh-pet-launcher
+      name: './index.js'
+      config:
+        engine: 'python'
+        autoStart: true
+        trayIcon: false

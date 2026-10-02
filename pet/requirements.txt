@@ -1,0 +1,50 @@
+PySide6>=6.5
+imageio-ffmpeg>=0.6
+Pillow>=10
+keyring>=25
+certifi>=2024.0.0
+pycaw>=0.0.13; platform_system == "Windows"
+tzdata>=2024.1
+# 节日提醒（pet/festival_calendar.py）的农历与 24 节气换算。
+#
+# 许可证是硬约束：**不要换成流传更广的 lunardate / zhdate**。那两个都是
+# GPL-3.0-or-later（同源于 1988 年 Fung F. Lee / Ricky Yeung 的 GPLv2
+# lunar 项目），而本项目是 MIT，引入即造成 copyleft 传染。lunar-python
+# (6tail) 为 MIT，纯 Python，无数据文件、无传递依赖，PyInstaller 静态
+# 分析可完整收集（无需 --collect-all）。其农历与节气日已实测校验。
+lunar-python>=1.4.8
+
+# 语音报时（pet/voice_chime_service.py）的在线 TTS：edge-tts 走微软免费在线
+# 语音服务合成 mp3 后缓存播放。缺失时服务降级为仅气泡提示（不崩溃），但
+# 打包版用户无法自行 pip 安装——所以在此声明为运行时依赖，并在三个构建
+# 脚本里配 --collect-all edge_tts（它用 importlib.metadata 取版本、子模块
+# 存在动态导入，PyInstaller 静态分析收不全）。
+edge-tts>=6.1.10
+
+# —— 歌词显示（可选）——
+# 「显示歌词」功能靠 Windows 系统媒体控制（SMTC）读取当前播放的曲目。
+# 不装不影响桌宠本体：歌词能力探测返回不可用，
+# 设置页的歌词开关置灰并说明原因，其余功能一切照旧。
+# 打包时注意 winrt 是 namespace package，需在 hiddenimports 里登记子模块
+# （winrt.windows.media.control / winrt.windows.foundation.collections），
+# 否则 PyInstaller 会漏收。
+winrt-Windows.Media.Control>=3.0; platform_system == "Windows"
+winrt-Windows.Foundation>=3.0; platform_system == "Windows"
+winrt-Windows.Foundation.Collections>=3.0; platform_system == "Windows"
+winrt-Windows.Storage.Streams>=3.0; platform_system == "Windows"
+
+# 歌词显示用它的「播放器进程在不在」判断来**避开 SMTC 的永久阻塞**
+# （见 pet/now_playing.py::player_process_running：进程不在就直接启动播放器、
+# 不碰 WinRT）。缺失时该判断按设计放行（宁可多试一次也不误伤），但这恰恰
+# 意味着 SMTC 卡住的那条路照旧会走——所以它是**运行时依赖**，必须在这里声明、
+# 并在三个构建脚本里 collect，否则打包版拿不到它，「避开阻塞」等于没生效。
+# 纯 Python、静态 import，PyInstaller 静态分析即可收集。
+psutil>=5.9
+
+# —— 开发依赖（测试 + 静态检查）——
+# pytest：测试套件入口（README「测试与验证」与本仓库 CI 都依赖它）。
+# ruff：`ruff check pet/ tests/` 用的静态检查器（规则基线见 pyproject.toml
+# 的 [tool.ruff]，仅 F 级）。不参与运行时；声明在此使 fresh environment
+# 能按 requirements 复现静态检查（FINAL_REVIEW_GPT.md 提交卫生项，批10 补）。
+pytest>=8
+ruff>=0.5

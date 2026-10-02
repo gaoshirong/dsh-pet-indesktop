@@ -1,0 +1,95 @@
+# -*- coding: utf-8 -*-
+"""Legacy context-menu layout.
+
+Keep this module intentionally independent from ``modern.py``: preserving the
+original interaction model is more important than sharing layout code.
+"""
+from __future__ import annotations
+
+from PySide6.QtWidgets import QMenu
+
+from .shared import (
+    add_action,
+    add_agent_link_menu,
+    add_proactive_menu,
+    add_autostart,
+    add_clear_spawned_pets,
+    add_drag_physics,
+    add_deepseek_web,
+    add_edge_probe,
+    add_agent_cost,
+    add_submenu,
+    add_golden_spin,
+    add_music_next,
+    add_music_open_netease,
+    add_music_open_qqmusic,
+    add_music_pause,
+    add_music_prev,
+    add_music_quit,
+    add_harness,
+    add_no_move,
+    add_on_top,
+    add_quit,
+    add_return_corner,
+    add_spawn_pet,
+    add_template_switch,
+    build_animation_categories,
+    build_character_menu,
+    build_size_menu,
+    build_speed_menu,
+)
+
+
+def build_legacy_menu(menu: QMenu, pet, template: dict) -> None:
+    """Build only the classic flat menu and its original settings entry."""
+    chat = getattr(pet, "on_open_chat", None)
+    chat_settings = getattr(pet, "on_open_chat_settings", None)
+    legacy_settings = getattr(pet, "on_open_legacy_settings", None)
+    if chat is not None:
+        add_action(menu, "AI 对话", None, chat, close_on_trigger=True)
+    if chat_settings is not None:
+        add_action(menu, "AI 设置", None, chat_settings, close_on_trigger=True)
+    if legacy_settings is not None:
+        add_action(menu, "桌宠设置", None, legacy_settings, close_on_trigger=True)
+
+    menu.addSeparator()
+    build_animation_categories(menu, pet, icons=False, legacy_labels=True)
+    build_speed_menu(menu, pet, icons=False)
+    add_drag_physics(menu, pet, icons=False)
+    build_character_menu(menu, pet, icons=False)
+
+    menu.addSeparator()
+    add_return_corner(menu, pet, icons=False)
+    add_on_top(menu, pet, icons=False)
+    add_no_move(menu, pet, icons=False)
+    add_autostart(menu, icons=False)
+    add_spawn_pet(menu, pet)
+    add_clear_spawned_pets(menu, pet, icons=False)
+    add_golden_spin(menu, pet, icons=False)
+    add_agent_cost(menu, pet, icons=False)
+    # legacy 布局约定无图标（测试 test_legacy_config_value_dispatches_legacy_layout 守着）
+    music_menu = add_submenu(menu, "音乐")
+    add_music_pause(music_menu, pet, icons=False)
+    add_music_next(music_menu, pet, icons=False)
+    add_music_prev(music_menu, pet, icons=False)
+    add_music_quit(music_menu, pet, icons=False)
+    music_menu.addSeparator()
+    add_music_open_netease(music_menu, pet, icons=False)
+    add_music_open_qqmusic(music_menu, pet, icons=False)
+    add_edge_probe(menu, pet, icons=False)
+    build_size_menu(menu, pet, icons=False)
+
+    menu.addSeparator()
+    # 纯桌宠（无 Chat/DSH 联动）版本不再显示“启动 DeepSeek Harness”，
+    # 仅保留“打开网页版 DeepSeek”。
+    if getattr(pet, "on_open_chat", None) is not None:
+        add_harness(menu, pet, icons=False)
+    add_deepseek_web(menu, icons=False)
+    add_proactive_menu(menu, pet)
+    add_agent_link_menu(menu, pet)
+
+    menu.addSeparator()
+    add_template_switch(menu, pet, str(template["switch_label"]), str(template["switch_to"]), icons=False)
+
+    menu.addSeparator()
+    add_quit(menu, pet, icons=False)

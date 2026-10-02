@@ -1,0 +1,14 @@
+{
+  "name": "@local/dsh-pet-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "description": "桌宠进程宿主：以 bundle 形式插入 launcher 行并托管全功能 Python 版桌宠。刻意不声明 dsh.client。",
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,1605 @@
+# -*- coding: utf-8 -*-
+"""配置读取与持久化；兼容旧版平铺 chat_* 字段的迁移。"""
+
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
+
+from . import catalog
+from .report_gates import (
+    LEGACY_PERCENT_GATES,
+    LEGACY_SWITCH_GATES,
+    REPORT_GATE_DEFAULTS,
+    clean_report_gates,
+)
+
+
+DEFAULT_ANIMATION_GAP_SECONDS = 0.0
+DEFAULT_SELF_TALK_MIN_INTERVAL = 20.0
+DEFAULT_SELF_TALK_MAX_INTERVAL = 60.0
+DEFAULT_SELF_TALK_DURATION_SECONDS = 3.2
+DEFAULT_SELF_TALK_TEXTS = [
+    "\u597d\u5973\u5b69\u2026\u2026",
+    "\u597d\u6a21\u578b\u2026\u2026",
+    "\u6b27\u9cb8\u9cb8\u2026\u2026",
+    "\u4eca\u5929\u4e5f\u8981\u8ba4\u771f\u5de5\u4f5c\u5440\u3002",
+    "\u518d\u966a\u4f60\u4e00\u4f1a\u513f\u3002",
+]
+DEFAULT_SELF_TALK_BUBBLE_STYLE = "classic_top"
+# 自言自语出图概率（百分比 0~100）：先决定"这次出图还是出文本"，再在对应池里等权
+# 抽一条。默认 30%——图片目录常有几十张图，若与文本等权随机会让图片彻底压过文本
+# （实测某配置 24 图 + 5 句 → 出图 82.8%，点击几乎总是弹图）。
+DEFAULT_SELF_TALK_IMAGE_CHANCE = 30
+DEFAULT_DIALOGUE_PHRASES = {}
+DEFAULT_COLLISION_SETTINGS = {
+    "collision_enabled": True,
+    "collision_restitution": 0.82,
+    "collision_friction": 0.08,
+    "collision_mass_scale": 1.0,
+    "collision_impulse_cap": 9000.0,
+    "collision_sound_enabled": True,
+    "collision_sound_volume": 0.70,
+}
+SELF_TALK_BUBBLE_STYLES = {
+    "classic_top",
+    "paper_left",
+    "glass_right",
+    "soft_blue_top",
+    "breath_bubble",
+}
+DEFAULT_CONTEXT_MENU_APPEARANCE = {
+    "theme": "system",
+    "density": "standard",
+    "corner_radius": 12,
+    "ui_font": "system",
+    "ui_font_size": 13,
+    "translucent": True,
+    "opacity": 0.94,
+    "light_background": "#ffffff",
+    "light_foreground": "#171717",
+    "light_hover": "#eeeeee",
+    "dark_background": "#252525",
+    "dark_foreground": "#f3f3f3",
+    "dark_hover": "#3a3a3a",
+}
+DEFAULT_MENU_EASTER_EGG = {
+    "enabled": True,
+    "title": "厉害了我的鲸",
+    "hint": "请点击",
+    "avatar": "assets/big_blue_fat_fish/ojingjing.jpg",
+    "image_dir": "assets/big_blue_fat_fish",
+}
+DEFAULT_QUICK_LAUNCH_APPS = [
+    {"name": "默认浏览器", "path": "", "kind": "default_browser"},
+]
+
+
+# 2026-09-23：右键菜单去掉「鼠标穿透」（该开关的唯一入口收敛到桌宠设置 + 托盘菜单），
+# 用户旧布局里残留的该节点在此一次性剔除——否则菜单编辑器会把它一直回存成「此平台
+# 不可用」，旧入口就没有干净去向（docs/SETTINGS-CHANGE-GATES.md「旧 key/旧入口有去向」）。
+# 同名 action id 若将来重新引入，删掉这里即可。
+_MENU_LAYOUT_DROPPED_ACTIONS = frozenset({"mouse_through"})
+
+
+def _drop_removed_menu_actions(nodes):
+    kept = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            kept.append(node)
+            continue
+        if (node.get("type") == "action"
+                and str(node.get("id") or "") in _MENU_LAYOUT_DROPPED_ACTIONS):
+            continue
+        children = node.get("children")
+        if isinstance(children, list):
+            node["children"] = _drop_removed_menu_actions(children)
+        kept.append(node)
+    return kept
+
+
+def _clean_menu_layout_override(value):
+    if not isinstance(value, dict):
+        return None
+    cleaned = copy.deepcopy(value)
+    nodes = cleaned.get("nodes")
+    if isinstance(nodes, list):
+        cleaned["nodes"] = _drop_removed_menu_actions(nodes)
+    return cleaned
+
+
+def _clean_color(value, default):
+    value = str(value or "").strip()
+    if len(value) == 7 and value.startswith("#"):
+        try:
+            int(value[1:], 16)
+            return value.lower()
+        except ValueError:
+            pass
+    return default
+
+
+def _clean_menu_appearance(value):
+    value = value if isinstance(value, dict) else {}
+    defaults = DEFAULT_CONTEXT_MENU_APPEARANCE
+    theme = str(value.get("theme", "system"))
+    density = str(value.get("density", "standard"))
+    try:
+        radius = int(value.get("corner_radius", 12))
+    except (TypeError, ValueError):
+        radius = 12
+    try:
+        font_size = int(value.get("ui_font_size", 13))
+    except (TypeError, ValueError):
+        font_size = 13
+    result = {
+        "theme": theme if theme in {"system", "light", "dark"} else "system",
+        "density": density if density in {"compact", "standard", "spacious"} else "standard",
+        "corner_radius": max(6, min(18, radius)),
+        "ui_font": str(value.get("ui_font") or "system")[:80],
+        "ui_font_size": max(10, min(18, font_size)),
+        "translucent": bool(value.get("translucent", True)),
+        "opacity": _float_or_default(value.get("opacity"), 0.94, 0.72, 1.0),
+    }
+    for key in (
+        "light_background",
+        "light_foreground",
+        "light_hover",
+        "dark_background",
+        "dark_foreground",
+        "dark_hover",
+    ):
+        result[key] = _clean_color(value.get(key), defaults[key])
+    return result
+
+
+def _normalize_fun_asset_path(candidate: str, default: str) -> str:
+    """绝对路径若指向应用内置 assets 目录，归一化为相对路径。
+
+    旧版设置对话框会把默认相对路径固化成安装目录绝对路径；portable
+    目录一移动/自更新即失效。此处在加载时统一还原为 assets/... 相对值。
+    """
+    candidate = str(candidate or "").strip()
+    if not candidate:
+        return default
+    path = Path(candidate).expanduser()
+    if not path.is_absolute():
+        return candidate
+    assets_root = Path(__file__).resolve().parents[1] / "assets"
+    try:
+        rel = path.resolve().relative_to(assets_root.resolve())
+        # 统一正斜杠：配置值与 legacy 迁移比较、跨平台一致
+        return str(Path("assets") / rel).replace("\\", "/")
+    except ValueError:
+        return candidate
+
+
+def _clean_menu_easter_egg(value):
+    value = value if isinstance(value, dict) else {}
+    defaults = DEFAULT_MENU_EASTER_EGG
+    avatar = _normalize_fun_asset_path(str(value.get("avatar") or defaults["avatar"]).strip()[:500], defaults["avatar"])
+    image_dir = _normalize_fun_asset_path(str(value.get("image_dir") or defaults["image_dir"]).strip()[:500], defaults["image_dir"])
+    return {
+        "enabled": bool(value.get("enabled", defaults["enabled"])),
+        "title": str(value.get("title") or defaults["title"]).strip()[:40],
+        "hint": str(value.get("hint") or defaults["hint"]).strip()[:20],
+        "avatar": avatar,
+        "image_dir": image_dir,
+    }
+
+
+def _clean_quick_launch_apps(value):
+    if not isinstance(value, list):
+        return [dict(item) for item in DEFAULT_QUICK_LAUNCH_APPS]
+    cleaned = []
+    for item in value[:20]:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "application")
+        path = str(item.get("path") or "").strip()
+        name = str(item.get("name") or "").strip()[:60]
+        if kind == "default_browser":
+            cleaned.append({"name": name or "默认浏览器", "path": "", "kind": "default_browser"})
+        elif path and name:
+            cleaned.append({"name": name, "path": path, "kind": "application"})
+    return cleaned
+
+
+def _default_proactive_screen_data() -> dict:
+    return {
+        "enabled": False,
+        "dry_run": False,
+        "preset": "balanced",
+        "allow_when_mouse_through": True,
+        "whitelist": [],
+        "dwell_seconds": 45,
+        "require_idle": False,
+        "min_idle_seconds": 30,
+        "cooldown_minutes": 5,
+        "daily_cap": 15,
+        "min_request_interval_seconds": 60,
+        "change_threshold": 8,
+        "prefer_free_provider": True,
+        "pre_cue": True,
+    }
+
+
+def _default_agent_link_data() -> dict:
+    return {
+        "dsh": False,
+        "claude": False,
+        "cursor": False,
+        "opencode": False,
+        # 自定义联动 Agent（协议见 docs/AGENT_LINK_PROTOCOL.md §4）：只读监听
+        # 用户指定的事件文件，不写外部配置、无需授权弹窗，默认空
+        "custom_agents": [],
+        # 事件气泡触发概率（默认值见 pet/report_gates.py）：设置页把它们收进
+        # 「自动化与联动 → 事件气泡触发概率」下的可折叠框，按事件聚合类别逐类调。
+        # 值是**通过概率** 0.00–1.00（0 = 该类完全不汇报，1 = 全部汇报），没有布尔开关。
+        "report_gates": dict(REPORT_GATE_DEFAULTS),
+        # 卡住检测（默认开）：DSH 联动开启时，根据工具成败/超时/错误
+        # 推断「Agent 钻牛角尖了」，档位 1 播焦急动画、档位 2 弹持续提醒气泡。
+        "stuck_detect": True,
+        "stuck_worried_threshold": 3,
+        "stuck_intervene_threshold": 5,
+        "stuck_window_seconds": 90,
+        "stuck_cooldown_seconds": 300,
+        "stuck_reminder_text": "",
+        "exploration_watchdog_enabled": True,
+        "exploration_watchdog_warning_threshold": 3,
+        "exploration_watchdog_control_threshold": 5,
+        "exploration_watchdog_cooldown_steps": 3,
+        "exploration_watchdog_early_grace_minutes": 5,
+        "exploration_watchdog_long_run_minutes": 10,
+        "exploration_watchdog_long_think_seconds": 120,
+        # 行为模式检测（默认开）：双窗口规则识别慢性循环 / 短时爆发 / 纯探索无产出。
+        # 细分类：W10 同类 >= 3 → warning；W10 >= 4 → control；W6 >= 3 → control。
+        # 大类：W6 EXPLORATION >= 5 且 ACTION == 0 → control；W10 EXPLORATION >= 7 且
+        # ACTION <= 1 → warning。触发后至少新增 pattern_min_steps_between 个 step
+        # 且间隔 pattern_cooldown_seconds 秒才允许再次触发（step 去重防止误杀并行调用）。
+        "pattern_detect": True,
+        "pattern_w6_control": 3,
+        "pattern_w10_warn": 3,
+        "pattern_w10_control": 4,
+        "pattern_macro_w6_explore": 5,
+        "pattern_macro_w6_action": 0,
+        "pattern_macro_w10_explore": 7,
+        "pattern_macro_w10_action": 1,
+        "pattern_min_steps_between": 3,
+        "pattern_cooldown_seconds": 60,
+        # 音效配置
+        "sound_enabled": False,
+        "sound_start_path": "builtin:agent-start",
+        "sound_done_path": "builtin:agent-done",
+        "sound_error_path": "builtin:agent-error",
+        "sound_volume": 0.65,
+        "sound_cooldown_seconds": 2.0,
+        "sound_start_enabled": True,
+        "sound_done_enabled": True,
+        "sound_error_enabled": True,
+    }
+
+
+def _default_click_sound_pack() -> dict:
+    return {"kind": "builtin", "id": "default", "path": ""}
+
+
+def _clean_click_sound_pack(value: Any) -> dict:
+    defaults = _default_click_sound_pack()
+    if not isinstance(value, dict):
+        return dict(defaults)
+    kind = str(value.get("kind") or "builtin").strip().lower()
+    if kind not in {"builtin", "file", "folder"}:
+        return dict(defaults)
+    pack_id = str(value.get("id") or ("default" if kind == "builtin" else "custom")).strip()
+    if kind == "builtin" and pack_id not in {"default", "duck"}:
+        pack_id = "default"
+    path = str(value.get("path") or "").strip()[:500]
+    return {
+        "kind": kind,
+        "id": pack_id,
+        "path": path,
+    }
+
+
+# 内置联动 Agent 键：custom_agents 的 key 不得与之重复
+_AGENT_LINK_BUILTIN_KEYS = ("dsh", "claude", "cursor", "opencode")
+# 自定义联动 Agent 条目上限（防配置文件被塞爆）
+_CUSTOM_AGENT_MAX = 8
+
+
+def _clean_custom_agents(raw: Any) -> list[dict]:
+    """清洗自定义联动 Agent 列表（agent_link.custom_agents）。
+
+    条目 {key, name, path}：key 为小写标识（不得与内置键/其他条目重复），
+    name 为显示名（缺省用 key），path 为事件文件路径（支持 ~，允许暂不存在）。
+    非法条目直接丢弃，超出上限截断。"""
+    if not isinstance(raw, list):
+        return []
+    result: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        if len(result) >= _CUSTOM_AGENT_MAX:
+            break
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", key):
+            continue
+        if key in _AGENT_LINK_BUILTIN_KEYS or key in seen:
+            continue
+        path = str(item.get("path") or "").strip()[:500]
+        if not path:
+            continue
+        name = str(item.get("name") or "").strip()[:50] or key
+        seen.add(key)
+        result.append({"key": key, "name": name, "path": path})
+    return result
+
+
+def _clean_agent_link_data(raw: Any) -> dict:
+    defaults = _default_agent_link_data()
+    if not isinstance(raw, dict):
+        return dict(defaults)
+    result = dict(defaults)
+    # 保留传入的额外合法键（例如 thinking_text, thinking_texts 等）
+    result.update(raw)
+    result["custom_agents"] = _clean_custom_agents(raw.get("custom_agents"))
+    for key in (
+        "dsh",
+        "claude",
+        "cursor",
+        "opencode",
+        "sound_enabled",
+        "sound_start_enabled",
+        "sound_done_enabled",
+        "sound_error_enabled",
+    ):
+        if key in raw:
+            result[key] = bool(raw[key])
+    for key in ("sound_start_path", "sound_done_path", "sound_error_path"):
+        if key in raw:
+            val = str(raw[key] or "").strip()[:500]
+            result[key] = val or defaults[key]
+    if "sound_volume" in raw:
+        result["sound_volume"] = _float_or_default(raw.get("sound_volume"), defaults["sound_volume"], 0.0, 1.0)
+    if "sound_cooldown_seconds" in raw:
+        result["sound_cooldown_seconds"] = _float_or_default(raw.get("sound_cooldown_seconds"), defaults["sound_cooldown_seconds"], 0.0, 30.0)
+    # 事件汇报概率门：新形状（report_gates 字典）优先；旧键一次性迁移——
+    # 布尔开关 → 1.0/0.0，旧百分比 report_probability(0-100) → activity 概率。
+    # 迁移后**不再写出旧键**，配置里不留兼容别名（用户可编辑文案的键名另见
+    # docs/PERSONA-PHRASES-PRESET-STORAGE-2026-09-08.md）。
+    raw_gates = raw.get("report_gates")
+    gates = clean_report_gates(raw_gates)
+    if not isinstance(raw_gates, dict):
+        for legacy_key, gate in LEGACY_SWITCH_GATES.items():
+            if legacy_key in raw:
+                gates[gate] = 1.0 if bool(raw[legacy_key]) else 0.0
+        for legacy_key, gate in LEGACY_PERCENT_GATES.items():
+            if legacy_key in raw:
+                percent = _float_or_default(raw.get(legacy_key), REPORT_GATE_DEFAULTS[gate] * 100.0, 0.0, 100.0)
+                gates[gate] = min(1.0, max(0.0, percent / 100.0))
+    result["report_gates"] = gates
+    for legacy_key in (*LEGACY_SWITCH_GATES, *LEGACY_PERCENT_GATES):
+        result.pop(legacy_key, None)
+    return result
+
+
+def _merge_proactive_screen_data(raw: Any) -> dict:
+    result = _default_proactive_screen_data()
+    if isinstance(raw, dict):
+        result.update(raw)
+    return result
+
+
+def _merge_agent_link_data(raw: Any) -> dict:
+    return _clean_agent_link_data(raw)
+
+
+def _default_file_interpret_data() -> dict:
+    """拖文件解读（file_interpret）默认值；消费方 pet/file_interpret.py。"""
+    return {
+        # 拖文件后提供「解读」确认气泡；关闭则拖放只有吃动画，不询问
+        "enabled": True,
+        # 进度汇报间隔（秒），产品区间 [5,120]；PR3 增加 progress_mode（heartbeat/chunked）
+        "progress_interval_seconds": 15.0,
+    }
+
+
+def _merge_file_interpret_data(raw: Any) -> dict:
+    result = _default_file_interpret_data()
+    if isinstance(raw, dict):
+        result.update(raw)
+    return result
+
+
+def _default_chat_data():
+    return {
+        "enabled": True,
+        "active_provider": "openai-main",
+        "default_system_prompt": "\u4f60\u662f\u4e00\u53ea\u53ef\u7231\u7684\u684c\u9762\u5ba0\u7269\uff0c\u8bf7\u7528\u81ea\u7136\u3001\u53cb\u5584\u7684\u4e2d\u6587\u548c\u7528\u6237\u4ea4\u6d41\u3002",
+        "history_message_limit": 40,
+        "history_char_limit": 24000,
+        "providers": {
+            "openai-main": {
+                "name": "DeepSeek",
+                "base_url": "https://api.deepseek.com",
+                "chat_path": "/v1/chat/completions",
+                "model": "deepseek-v4-flash",
+                "api_key_ref": "provider/openai-main",
+                "api_key": "",
+                "timeout": 60.0,
+                "temperature": 0.7,
+                "max_tokens": 2048,
+            }
+        },
+    }
+
+
+def _merge_chat_data(raw):
+    result = _default_chat_data()
+    raw = raw if isinstance(raw, dict) else {}
+    result.update({k: v for k, v in raw.items() if k != "providers"})
+    incoming = raw.get("providers")
+    if isinstance(incoming, dict) and incoming:
+        providers = {}
+        for provider_id, provider in incoming.items():
+            if isinstance(provider, dict):
+                base = dict(_default_chat_data()["providers"].get("openai-main", {}))
+                base.update(provider)
+                # 非 openai-main provider 未显式写 api_key_ref 时按自身归位，
+                # 避免沿用 openai-main 的钥匙串条目（密钥串用/查错 key）。
+                # 必须看用户原始输入：base 已被 openai-main 默认值预填，判 base 永远非空。
+                if not str(provider.get("api_key_ref") or "").strip():
+                    base["api_key_ref"] = f"provider/{provider_id}"
+                # 历史 bug 迁移：旧版本曾把 openai-main 的钥匙串引用继承给自定义 provider，
+                # UI 从不暴露该字段，非主 provider 挂着主引用一定是继承错的。
+                if provider_id != "openai-main" and base.get("api_key_ref") == "provider/openai-main":
+                    base["api_key_ref"] = f"provider/{provider_id}"
+                providers[str(provider_id)] = base
+    else:
+        providers = dict(result["providers"])
+    result["providers"] = providers or _default_chat_data()["providers"]
+    active = str(result.get("active_provider") or "")
+    result["active_provider"] = active if active in result["providers"] else next(iter(result["providers"]))
+    return result
+
+
+def _default_base():
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA") or Path.home())
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support"
+    return Path.home() / ".config"
+
+
+def _app_dir_name() -> str:
+    """打包变体的独立数据目录名；源码运行时回退到共享目录。
+
+    构建脚本（scripts/build_onedir.ps1）会在打包前生成
+    packaging/build_variant.py（VARIANT = "webm-chat" 等），
+    使 Chat / 无 Chat 等变体各自使用独立的配置目录、会话与自启项。
+    """
+    try:
+        from build_variant import VARIANT  # 仅打包产物中存在
+
+        name = str(VARIANT).strip()
+        if name:
+            return f"dsh-pet-standalone-{name}"
+    except Exception:
+        pass
+    return "dsh-pet-standalone"
+
+
+APP_DIR_NAME = _app_dir_name()
+
+
+def _float_or_default(value, default, minimum, maximum):
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：json.loads 会把超长整数字面量解析成 Python int，
+        # float(10**400) 直接抛——不接住就是 Config() 构造失败、启动崩。
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def _bool_or_default(value, default):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return bool(default)
+
+
+def _clean_music_player_paths(value) -> dict:
+    """手动指定的播放器可执行文件路径 {播放器键: 路径}。
+
+    键只认 music_players.PLAYERS 里的两个播放器（其余键丢弃，避免手改配置塞进
+    任何多余东西）；值必须是字符串路径，空串/非字符串一律丢弃。限长与其它路径键
+    同规（500 字符），只做配置面清洗，不碰文件系统——路径是否存在由消费方判定。
+    """
+    if not isinstance(value, dict):
+        return {}
+    cleaned = {}
+    for key in ("netease", "qqmusic"):
+        raw = value.get(key)
+        if not isinstance(raw, str):
+            continue
+        path = raw.strip()
+        if path:
+            cleaned[key] = path[:500]
+    return cleaned
+
+
+def _clean_self_talk_texts(value):
+    if not isinstance(value, list):
+        return list(DEFAULT_SELF_TALK_TEXTS)
+    texts = []
+    for item in value:
+        text = str(item).strip()
+        if text and text not in texts:
+            texts.append(text[:120])
+    return texts or list(DEFAULT_SELF_TALK_TEXTS)
+
+
+def _default_dynamic_island_data() -> dict:
+    """灵动岛默认配置：默认开启常驻，位置留空由首次显示时自动定位。"""
+    return {
+        "enabled": True,
+        "show_icon": True,
+        "show_name": True,
+        "show_info": True,
+        "info_mode": "time",  # time / balance_tier / balance / custom
+        "custom_text": "",
+        "show_status": True,
+        "style": "dark",  # dark / light / glass
+        "opacity": 1.0,  # 背景不透明度 0.4~1.0
+        "accent": "blue",  # 主题色：blue / green / purple / pink / orange
+        # 图标：auto=鱼本体头像图片（默认，不碰 emoji 字体栈）；img:<路径>=自定义
+        # 图片；其余字符串=文字/emoji（用户主动选择，愿意付首次绘制的一次性税额）
+        "icon": "auto",
+        "click_action": "expand",  # expand（展开卡片）/ toggle_pet（切换显隐，旧行为）
+        "hidden_chat": True,  # 桌宠隐藏时：单击岛弹对话气泡；AI 回复到达时岛上弹预览
+        "event_effects": True,  # 事件动效：AI 回复/余额刷新/峰谷切换弹跳
+        "edge_dock": True,  # 拖到屏幕边缘收成细条，鼠标靠近滑出
+        "dock_edge": "none",  # none / top / bottom / left / right（拖拽落点写入）
+        "collision_enabled": True,  # 果冻墙：岛注册为静态碰撞体，肥鱼撞到会弹开
+        "x": None,
+        "y": None,
+    }
+
+
+def _clean_dynamic_island_data(value) -> dict:
+    defaults = _default_dynamic_island_data()
+    if not isinstance(value, dict):
+        return defaults
+    result = dict(defaults)
+    result.update({k: v for k, v in value.items() if k in defaults})
+    result["enabled"] = bool(result["enabled"])
+    result["show_icon"] = bool(result["show_icon"])
+    result["show_name"] = bool(result["show_name"])
+    result["show_info"] = bool(result["show_info"])
+    result["show_status"] = bool(result["show_status"])
+    mode = str(result.get("info_mode") or "time").strip()
+    result["info_mode"] = mode if mode in {"time", "balance_tier", "balance", "custom"} else "time"
+    result["custom_text"] = str(result.get("custom_text") or "")[:80]
+    style = str(result.get("style") or "dark").strip()
+    result["style"] = style if style in {"dark", "light", "glass"} else "dark"
+    try:
+        result["opacity"] = max(0.4, min(1.0, float(result.get("opacity", 1.0))))
+    except (TypeError, ValueError):
+        result["opacity"] = 1.0
+    accent = str(result.get("accent") or "blue").strip()
+    result["accent"] = accent if accent in {"blue", "green", "purple", "pink", "orange"} else "blue"
+    # 图标归一化：auto 原样；img:<路径> 按路径保留（限长 260）；其余当文字/emoji
+    # 截到 8 字符；空值回 "auto"（默认走头像图片，不回退 emoji——首次 emoji 绘制
+    # 会触发 DirectWrite 彩色字体栈加载，实测定案一次性 +33.6MB 私有内存）
+    icon = str(result.get("icon") or "auto").strip()
+    if icon == "auto":
+        result["icon"] = "auto"
+    elif icon.startswith("img:"):
+        result["icon"] = icon[:260]
+    else:
+        result["icon"] = icon[:8] or "auto"
+    click_action = str(result.get("click_action") or "expand").strip()
+    result["click_action"] = click_action if click_action in {"expand", "toggle_pet"} else "expand"
+    # 布尔键必须用 _bool_or_default：bool("false") is True，字符串/None
+    # 会被误翻（同文件既有规则）；int 0/1 是旧配置的合法布尔编码，先归一
+    for _key in ("event_effects", "edge_dock", "collision_enabled", "hidden_chat"):
+        _v = result[_key]
+        if isinstance(_v, int) and not isinstance(_v, bool):
+            _v = bool(_v)
+        result[_key] = _bool_or_default(_v, defaults[_key])
+    edge = str(result.get("dock_edge") or "none").strip()
+    result["dock_edge"] = edge if edge in {"none", "top", "bottom", "left", "right"} else "none"
+    # 至少保留一个组件：全部关闭时强制显示信息槽，避免空胶囊。
+    if not (result["show_icon"] or result["show_name"] or result["show_info"] or result["show_status"]):
+        result["show_info"] = True
+    return result
+
+
+def _clean_character_profiles(value) -> dict:
+    """角色档案：当前先承载 click_talk_bindings，后续可扩展头像/人设字段。"""
+    if not isinstance(value, dict):
+        return {}
+    cleaned = {}
+    for character_id, profile in value.items():
+        if not isinstance(profile, dict):
+            continue
+        bindings_raw = profile.get("click_talk_bindings")
+        bindings = {}
+        if isinstance(bindings_raw, dict):
+            for action_id, texts in bindings_raw.items():
+                if not isinstance(texts, list):
+                    continue
+                items = []
+                for item in texts:
+                    text = str(item).strip()
+                    if text and text not in items:
+                        items.append(text[:120])
+                if items:
+                    bindings[str(action_id)] = items
+        entry = dict(profile)
+        entry["click_talk_bindings"] = bindings
+        cleaned[str(character_id)] = entry
+    return cleaned
+
+
+def _clean_collision_data(value: dict) -> dict:
+    """归一化碰撞设置：collision_* 一组 7 键。
+
+    从 Config._normalize_pet_settings 原样上提为模块级纯函数，供 Config 与
+    config_domains 的 CollisionConfig 共用；清洗逻辑本体一行未改。
+    """
+    result = dict(value)
+    result["collision_enabled"] = _bool_or_default(value.get("collision_enabled"), True)
+    result["collision_restitution"] = _float_or_default(value.get("collision_restitution"), 0.82, 0.0, 1.0)
+    result["collision_friction"] = _float_or_default(value.get("collision_friction"), 0.08, 0.0, 0.30)
+    result["collision_mass_scale"] = _float_or_default(value.get("collision_mass_scale"), 1.0, 0.5, 2.0)
+    result["collision_impulse_cap"] = _float_or_default(value.get("collision_impulse_cap"), 9000.0, 1000.0, 12000.0)
+    result["collision_sound_enabled"] = bool(value.get("collision_sound_enabled", True))
+    result["collision_sound_volume"] = _float_or_default(value.get("collision_sound_volume"), 0.70, 0.0, 1.0)
+    return result
+
+
+class Config:
+    def __init__(self, base=None, instance_id: str | None = None):
+        base = Path(base) if isinstance(base, str) else (base or _default_base())
+        self.dir = base / APP_DIR_NAME
+        # 多开隔离：--instance <id> 或 DSH_PET_INSTANCE 时使用独立配置文件，
+        # 位置/大小/朝向等不再互相覆盖；不传时完全保持原行为。
+        self.instance_id = (instance_id or os.environ.get("DSH_PET_INSTANCE", "") or "").strip()
+        self.path = self.dir / f"config-{self.instance_id}.json" if self.instance_id else self.dir / "config.json"
+        self._migrate_legacy_config(base)
+        # 副槽落种仅在该槽位还没有个体配置时进行；已有存档的 slot（用户改过
+        # 的）一律不动——「生小肥鱼」复用旧槽位时同样保留原槽设置。
+        if self.instance_id and not self.path.exists():
+            self._seed_slot_config_from_main()
+        self.data = {
+            "version": 4,
+            "rx": None,
+            "ry": None,
+            "screen_name": None,
+            "facing": "left",
+            "scale": catalog.DEFAULT_SCALE,
+            "spawn_inherit_size": True,  # 生小肥鱼继承主肥鱼大小（False 用 spawn_scale）
+            "spawn_scale": catalog.DEFAULT_SCALE,  # 关闭继承时生小肥鱼使用的尺寸
+            "spawn_inherit_dynamic_island": False,  # 生小肥鱼继承主肥鱼灵动岛（默认关=不开灵动岛）
+            "user_customized": False,  # 批 C：仅当用户在该子肥鱼自己的设置界面保存过才置真
+            "on_top": True,
+            "show_dock_icon": True,
+            "no_move": False,
+            "character": catalog.DEFAULT_CHARACTER,
+            "playback_speed": 1.0,
+            "animation_gap_seconds": DEFAULT_ANIMATION_GAP_SECONDS,
+            "self_talk_enabled": False,
+            "self_talk_min_interval": DEFAULT_SELF_TALK_MIN_INTERVAL,
+            "self_talk_max_interval": DEFAULT_SELF_TALK_MAX_INTERVAL,
+            "self_talk_duration_seconds": DEFAULT_SELF_TALK_DURATION_SECONDS,
+            "self_talk_image_scale": 100,  # 气泡配图显示尺寸百分比（50~300，100 = 默认）
+            "self_talk_image_chance": DEFAULT_SELF_TALK_IMAGE_CHANCE,  # 出图概率百分比（0~100）
+            "bubble_text_scale": 100,  # 气泡文字显示尺寸百分比（50~300，100 = 默认；气泡与字号一起放大）
+            "self_talk_texts": list(DEFAULT_SELF_TALK_TEXTS),
+            "self_talk_image_dir": "assets/big_blue_fat_fish",
+            "self_talk_bubble_style": DEFAULT_SELF_TALK_BUBBLE_STYLE,
+            # Existing event wording: legacy is deliberately the default.
+            "dialogue_mode": "legacy",
+            "dialogue_phrases": dict(DEFAULT_DIALOGUE_PHRASES),
+            "dialogue_last_scope": "",  # 台词编辑上次打开的层（""=全局；设置页专属文案入口记忆）
+            "mouse_through": False,
+            "cursor_hidden_passthrough": True,
+            "drag_physics": False,
+            "lock_position": False,  # 锁定位置：桌宠不可拖动（点击仍有效）
+            "shift_drag": False,  # 按住 SHIFT+左键才能拖动
+            "pet_opacity": 100,  # 桌宠窗口不透明度 10-100
+            "context_menu_template": "modern",
+            "context_menu_layout": None,
+            "context_menu_appearance": dict(DEFAULT_CONTEXT_MENU_APPEARANCE),
+            "menu_easter_egg": dict(DEFAULT_MENU_EASTER_EGG),
+            "quick_launch_apps": [dict(item) for item in DEFAULT_QUICK_LAUNCH_APPS],
+            "auto_hide_fullscreen": True,  # 全屏应用自动隐藏（Windows）
+            "click_sound_enabled": True,  # 点击 Q 弹音效
+            "click_sound_pack": _default_click_sound_pack(),
+            "click_sound_volume": 0.70,
+            "slingshot_enabled": True,  # 弹弓弹射
+            "throw_strength": "standard",  # gentle / standard / strong / crazy
+            "idle_low_fps_enabled": False,  # 闲置降帧（灰度默认关）：长时间无交互时动画隔帧呈现
+            "idle_low_fps_threshold": 30.0,  # 闲置阈值（秒）：超过该时长无交互且窗口可见才降帧
+            "click_show_balance": False,  # 点击显示 DeepSeek 余额
+            "click_show_self_talk": False,  # 点击随机显示自定义自言自语
+            "self_talk_speak_enabled": True,  # 点击自言自语同句朗读（复用语音报时音频通道）
+            "self_talk_voice_precache_enabled": False,  # 台词/点击绑定本地语音预缓存（需本机 TTS 服务，默认关）
+            "balance_refresh_minutes": 0,  # DeepSeek 余额自动刷新间隔（分钟，0=关闭）
+            # 查余额用哪个 provider（留空 = 自动挑一个配了 Key 的 HTTP provider）。
+            # 与聊天用的 active_provider **相互独立**：聊天可以走 dsh-session
+            # （DSH 会话，不需要 Key），余额仍用 DeepSeek 官方账号查——
+            # 否则为了查余额切换 active_provider 会把聊天一起带走。
+            "balance_provider": "",
+            "balance_tier_labels_mode": "default",  # 峰谷提示文案：default / liangwen / custom
+            "balance_tier_label_peak": "",  # 自定义“高峰”文本（custom 模式）
+            "balance_tier_label_idle": "",  # 自定义“空闲”文本（custom 模式）
+            "balance_tier_color_enabled": True,  # 峰谷提示颜色：高峰红/低谷绿
+            "music_sing_enabled": False,  # 检测到后台播放音乐时自动播放唱歌动画
+            "music_sing_grace_seconds": 6.0,  # 持续静音多久才判定音乐停止（避开间奏）
+            "music_lyric_enabled": False,  # 在气泡里显示当前播放歌曲的歌词（Windows SMTC）
+            "music_lyric_lead_seconds": 1.0,  # 歌词提前量（秒）：正值=歌词抢先于音频
+            "music_lyric_cache_limit": 2000,  # 歌词缓存条数上限，超出按最旧淘汰
+            # 手动指定播放器路径 {netease|qqmusic: exe 路径}：自动搜索找不到时的
+            # 逃生口，只能手改 config.json（暂无设置页控件），空 = 走自动搜索。
+            "music_player_paths": {},
+            "agent_cost_enabled": False,  # Agent 本轮结束时显示消费金额（用余额差值估算）
+            "golden_spin_on_click": False,  # 点击回应动画结束后自动接一段黄金回旋
+            "golden_spin_direct": False,  # 点击触发黄金回旋时跳过点击动画，直接回旋并逐圈加速
+            "edge_probe_enabled": False,  # 拖到屏幕左右边缘后自动进入探头姿态
+            "autostart_wanted": False,  # 用户曾开启过开机自启（用于启动自检：被安全软件清理时提醒）
+            "harness_autostart": False,  # 随桌宠启动自动拉起 dsh web 服务（只起服务，不开浏览器）
+            # 手动指定 pnpm 入口（文件 / 目录 / 包装脚本都行，语义同 DSH_PNPM_BIN）。
+            # 默认空 = 走内置的自动发现（PATH/注册表/各版本管理器/多布局）；
+            # 面向"环境特殊又不想改环境变量"的用户，属于开发者向高级键，不进设置页。
+            "pnpm_bin": "",
+            "stream_capture_mode": False,  # 直播捕获兼容模式（Windows：Tool 窗口直播姬/OBS 枚举不到）
+            "chat_background": "",  # 肥鱼牌小手机背景：空=纯色；builtin:* = 内置主题；否则为图片路径
+            "modern_chat_background": "",  # 肥鱼版 DeepSeek 背景：空=纯色；否则为自定义图片路径
+            "chat_background_opacity": 100,
+            "chat_background_fill": "cover",
+            "modern_chat_background_opacity": 100,
+            "modern_chat_background_fill": "cover",
+            "modern_chat_card_opacity": 84,
+            "chat_bg_crops": {},  # 每个背景的用户自定义取景框 {背景标识: [x,y,w,h] 归一化}
+            "character_aliases": {},  # 角色显示名别名 {角色id: 自定义名}，空名=恢复默认
+            "character_profiles": {},  # 角色档案：{角色id: {click_talk_bindings: {动画id: [台词]}}}
+            "chat_always_on_top": False,  # 聊天窗置顶
+            "dynamic_island": _default_dynamic_island_data(),
+            "proactive_screen": _default_proactive_screen_data(),
+            "agent_link": _default_agent_link_data(),
+            "file_interpret": _default_file_interpret_data(),
+            "chat_ui_style": "modern",  # modern / classic（仅聊天窗口保留双实现）
+            "chat_follow_pet": False,  # 聊天窗口是否跟随桌宠移动
+            "system_notifications_enabled": True,  # 对话完成/失败/需要授权时弹桌面系统通知
+            "todo_reminder_enabled": True,  # 待办提醒总开关
+            "todo_reminder_lead_minutes": 5,  # 待办提前提醒分钟数（0~60，0=不提前）
+            # 语音报时（edge-tts 在线 TTS + 台词/歌词按 8 小时整体换批、批内轮换）
+            "voice_chime_enabled": False,  # 语音报时总开关（默认关闭：主动打扰型功能，用户显式开启）
+            "voice_chime_schedule": "hourly",  # hourly / every_30 / every_15 / every_5 / every_minute / custom
+            "voice_chime_custom_times": "",  # 自定义时间点（HH:MM 逗号分隔，custom 模式生效）
+            "voice_chime_voice": "zh-CN-XiaoxiaoNeural",  # edge-tts 音色
+            "voice_chime_rate": 0,  # 语速偏移（%），-100~100
+            "voice_chime_pitch": 0,  # 音调偏移（Hz），-50~50
+            "voice_chime_volume": 80,  # 播放音量（0~100）
+            "voice_chime_show_bubble": True,  # 报时气泡开关
+            "voice_chime_show_quote": True,  # 台词/歌词开关
+            "voice_chime_custom_quotes_zh": "",  # 自定义中文台词/歌词（一行一条，留空回退内置库）
+            "voice_chime_custom_quotes_en": "",  # 自定义英文台词/歌词（一行一条，留空回退内置库）
+            # 节日提醒（农历/24 节气/西方节日；命中当日用气泡告知并附氛围匹配文案）。
+            # 总开关默认关闭：属"主动打扰"型功能，升级后不应突然冒出来，由用户显式开启。
+            "festival_reminder_enabled": False,  # 节日提醒总开关
+            "festival_reminder_cn": True,  # 中国节日
+            "festival_reminder_solar_terms": True,  # 24 节气
+            "festival_reminder_west": True,  # 西方节日
+            "festival_reminder_mode": "times",  # times（按次数）/ custom（自定义时间点）
+            "festival_reminder_count": 2,  # times 模式提醒次数（1~6，均匀铺在 09:00–21:00）
+            "festival_reminder_times": "09:00",  # custom 模式时间点（HH:MM 逗号分隔）
+            "festival_reminder_show_quote": True,  # 是否附诗词/引文
+            # 节日语音播报：复用语音报时服务的音频通道（音色/语速/音调/音量同报时），
+            # 故不新增独立的语音参数键。默认关闭。开启后同一分钟由节日让报时让位。
+            "festival_reminder_speak": False,  # 节日提醒是否语音播报
+            "festival_custom_quotes_cn": "",  # 自定义中文文案（一行一条，追加到内置库）
+            "festival_custom_quotes_west": "",  # 自定义西文文案（一行一条，追加到内置库）
+            **DEFAULT_COLLISION_SETTINGS,
+            "media_prewarm": "balanced",  # full / balanced / minimal 素材首帧预热力度
+            # 批10-A3：默认 32→8MB。预测式预热（批10-A1）落地后，首帧 LRU 只需
+            # 装「瞬时交互核 pinned（click/turn/drag）+ 1-2 个预测位」；idle/move
+            # 由预测机制与 LRU 热度自然覆盖，不再常驻。
+            "first_frame_cache_max_mb": 8,  # 首帧缓存全局预算（MB），低配机可调小
+            # 批10-A1 预测式接力预热：当前动画墙钟剩余 ≤ 该提前量（毫秒）时，
+            # 帧驱动提前掷骰决定下一动画并在后台预解码其首帧进 LRU（Phase 1）。
+            "predict_prewarm_lead_ms": 350,  # 提前量（ms），范围 200-600
+            # 批11-B1：ffmpeg 圈边界定期回收阈值（分钟）。长寿循环 reader 在圈
+            # 边界驻留时按进程存活时长评估回收：达到该值 → 不 park/re-arm，正常
+            # 退出杀进程、下一次 start() 自然 fresh spawn（把 47→64MB 的 ffmpeg
+            # 内部累积周期性清零）。0 = 关闭回收（回退保险）；否则范围 [2, 120]。
+            "ffmpeg_recycle_minutes": 10,
+            # 批5.2 spike（默认关）：开 = 「生小肥鱼」从 spawn 新进程改为进程内
+            # 创建第二个 PetInstance。关 = 行为与现状逐位一致（回退保险）。
+            "experimental_single_process_spawn": False,
+            # 批5.3：同角色共享解码链（进程内帧扇出）开关，默认开。仅当
+            # experimental_single_process_spawn（多窗）也为开时才真正激活——
+            # 单窗无共享可言，双门关任一即回每窗独立解码（批5.2 形态）。
+            "experimental_shared_decode": True,
+            # 设置页进程隔离：默认开 = 设置页拉到独立进程（--settings），关窗即
+            # 进程退出，OS 连锅端走首开留下的字体/样式/模块高水位（无卸载 API）；
+            # False = 完全回退进程内对话框旧路径（排障/回退保险，不新增控件）。
+            "settings_process_isolation": True,
+            "chat": _default_chat_data(),
+        }
+        self.reload()
+        self._normalize_pet_settings()
+
+    def _migrate_legacy_config(self, base) -> None:
+        """旧版各变体共用 %APPDATA%/dsh-pet-standalone；升级后首次运行时
+        把该目录的 config.json 与 sessions/ 一次性复制到变体独立目录，
+        避免用户设置与聊天会话“消失”。仅在新目录尚不存在时执行。"""
+        if self.instance_id:
+            return  # 多开实例不参与旧版迁移，避免把单开配置复制给每个实例
+        if APP_DIR_NAME == "dsh-pet-standalone" or self.path.exists():
+            return
+        legacy = base / "dsh-pet-standalone"
+        if not (legacy / "config.json").is_file():
+            return
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy / "config.json", self.path)
+            src_sessions = legacy / "sessions"
+            if src_sessions.is_dir():
+                shutil.copytree(src_sessions, self.dir / "sessions", dirs_exist_ok=True)
+        except OSError:
+            pass
+
+    def _seed_slot_config_from_main(self) -> None:
+        """新建副槽时继承主配置（批 C）：委托 slot_manager 的共享落种函数。
+
+        只在该槽位还没有个体配置文件时执行；已有存档的 slot-N 配置（用户改过
+        的）一律保持独立记忆，「生小肥鱼」复用旧槽位也不覆盖。副本生成逻辑
+        （spawn_inherit_size / spawn_scale / spawn_inherit_dynamic_island、位置键
+        剔除、脱敏、user_customized 置假）统一收敛在
+        ``slot_manager.seed_slot_config_from_main``，这里只负责把 instance_id
+        解析成 slot_id 后转发。
+        """
+        if not self.instance_id:
+            return
+        if not self.instance_id.startswith("slot-"):
+            return
+        suffix = self.instance_id[len("slot-") :]
+        if not suffix.isdigit():
+            # 非数值 slot 标识（如碰撞 IPC 测试用 slot-a/slot-p）不做落种。
+            return
+        slot_id = int(suffix)
+        from . import slot_manager as slot_manager_mod
+
+        slot_manager_mod.seed_slot_config_from_main(self.dir, slot_id)
+
+    def reload(self):
+        if not self.path.is_file():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            from . import slot_manager as slot_manager_mod
+
+            slot_manager_mod.backup_corrupt_config(self.path)
+            return
+        if not isinstance(raw, dict):
+            from . import slot_manager as slot_manager_mod
+
+            slot_manager_mod.backup_corrupt_config(self.path)
+            return
+        try:
+            old_version = int(raw.get("version", 1) or 1)
+        except (TypeError, ValueError):
+            old_version = 1  # 脏数据（手改/损坏）不得导致启动崩溃
+        if old_version < 2:
+            raw.pop("scale", None)
+        chat = raw.get("chat") if isinstance(raw.get("chat"), dict) else {}
+        legacy = {}
+        if "chat_enabled" in raw:
+            legacy["enabled"] = raw["chat_enabled"]
+        if "chat_system_prompt" in raw:
+            legacy["default_system_prompt"] = raw["chat_system_prompt"]
+        legacy_provider = {}
+        if raw.get("chat_api_url"):
+            legacy_provider["base_url"] = raw["chat_api_url"]
+        if raw.get("chat_model"):
+            legacy_provider["model"] = raw["chat_model"]
+        if raw.get("chat_api_key"):
+            legacy_provider["api_key"] = raw["chat_api_key"]
+        if legacy_provider:
+            legacy["providers"] = {"openai-main": legacy_provider}
+        merged = dict(legacy)
+        merged.update(chat)
+        # secret 只进不出：磁盘重载不得冲掉内存中的 key。
+        # _redacted_data() 写盘时会剔除 chat.providers 下的明文 api_key /
+        # vision_api_key（keyring 不可用时 key 只存内存 self.data），因此磁盘文件
+        # 里没有这两项。这里若某 provider 在磁盘数据里缺 api_key/vision_api_key
+        # 但合入前的内存里有，则保留内存值，避免设置对话框重开（自 config.reload()
+        # 从磁盘重载）把用户未重启就丢掉的 key 覆盖成空。新旧两套设置对话框都走
+        # 这条 reload() 路径，一处修复全覆盖。
+        previous_chat = self.data.get("chat")
+        previous_providers = previous_chat.get("providers") if isinstance(previous_chat, dict) else None
+        merged_chat = _merge_chat_data(merged)
+        self.data["chat"] = merged_chat
+        if isinstance(previous_providers, dict):
+            raw_providers = merged.get("providers")
+            raw_providers = raw_providers if isinstance(raw_providers, dict) else {}
+            merged_providers = merged_chat.get("providers")
+            if isinstance(merged_providers, dict):
+                for provider_id, merged_provider in merged_providers.items():
+                    if not isinstance(merged_provider, dict):
+                        continue
+                    previous_provider = previous_providers.get(provider_id)
+                    if not isinstance(previous_provider, dict):
+                        continue
+                    raw_provider = raw_providers.get(provider_id)
+                    raw_provider = raw_provider if isinstance(raw_provider, dict) else {}
+                    if "api_key" not in raw_provider and previous_provider.get("api_key"):
+                        merged_provider["api_key"] = previous_provider["api_key"]
+                    if "vision_api_key" not in raw_provider and previous_provider.get("vision_api_key"):
+                        merged_provider["vision_api_key"] = previous_provider["vision_api_key"]
+        for key in (
+            "rx",
+            "ry",
+            "screen_name",
+            "facing",
+            "scale",
+            "on_top",
+            "show_dock_icon",
+            "no_move",
+            "character",
+            "spawn_inherit_size",
+            "spawn_scale",
+            "spawn_inherit_dynamic_island",
+            "user_customized",
+            "playback_speed",
+            "animation_gap_seconds",
+            "self_talk_enabled",
+            "self_talk_min_interval",
+            "self_talk_max_interval",
+            "self_talk_texts",
+            "self_talk_duration_seconds",
+            "self_talk_image_dir",
+            "self_talk_image_scale",
+            "self_talk_image_chance",
+            "bubble_text_scale",
+            "self_talk_bubble_style",
+            "mouse_through",
+            "cursor_hidden_passthrough",
+            "drag_physics",
+            "context_menu_template",
+            "dialogue_mode",
+            "dialogue_phrases",
+            "dialogue_last_scope",
+            "context_menu_layout",
+            "lock_position",
+            "shift_drag",
+            "pet_opacity",
+            "context_menu_appearance",
+            "quick_launch_apps",
+            "menu_easter_egg",
+            "auto_hide_fullscreen",
+            "click_sound_enabled",
+            "click_sound_pack",
+            "click_sound_volume",
+            "slingshot_enabled",
+            "throw_strength",
+            "idle_low_fps_enabled",
+            "idle_low_fps_threshold",
+            "click_show_balance",
+            "click_show_self_talk",
+            "self_talk_speak_enabled",
+            "self_talk_voice_precache_enabled",
+            "balance_refresh_minutes",
+            "balance_provider",
+            "autostart_wanted",
+            "harness_autostart",
+            "stream_capture_mode",
+            "pnpm_bin",
+            "music_sing_enabled",
+            "music_sing_grace_seconds",
+            "music_lyric_enabled",
+            "music_lyric_cache_limit",
+            "music_lyric_lead_seconds",
+            "music_player_paths",
+            "agent_cost_enabled",
+            "golden_spin_on_click",
+            "golden_spin_direct",
+            "edge_probe_enabled",
+            "balance_tier_labels_mode",
+            "balance_tier_label_peak",
+            "balance_tier_label_idle",
+            "balance_tier_color_enabled",
+            "chat_background",
+            "modern_chat_background",
+            "chat_background_opacity",
+            "chat_background_fill",
+            "modern_chat_background_opacity",
+            "modern_chat_background_fill",
+            "modern_chat_card_opacity",
+            "chat_bg_crops",
+            "chat_ui_style",
+            "chat_follow_pet",
+            "system_notifications_enabled",
+            "todo_reminder_enabled",
+            "todo_reminder_lead_minutes",
+            "voice_chime_enabled",
+            "voice_chime_schedule",
+            "voice_chime_custom_times",
+            "voice_chime_voice",
+            "voice_chime_rate",
+            "voice_chime_pitch",
+            "voice_chime_volume",
+            "voice_chime_show_bubble",
+            "voice_chime_show_quote",
+            "voice_chime_custom_quotes_zh",
+            "voice_chime_custom_quotes_en",
+            "festival_reminder_enabled",
+            "festival_reminder_cn",
+            "festival_reminder_solar_terms",
+            "festival_reminder_west",
+            "festival_reminder_mode",
+            "festival_reminder_count",
+            "festival_reminder_times",
+            "festival_reminder_show_quote",
+            "festival_reminder_speak",
+            "festival_custom_quotes_cn",
+            "festival_custom_quotes_west",
+            "character_aliases",
+            "character_profiles",
+            "chat_always_on_top",
+            "dynamic_island",
+            "collision_enabled",
+            "collision_restitution",
+            "collision_friction",
+            "collision_mass_scale",
+            "collision_impulse_cap",
+            "collision_sound_enabled",
+            "collision_sound_volume",
+            "media_prewarm",
+            "first_frame_cache_max_mb",
+            "predict_prewarm_lead_ms",
+            "ffmpeg_recycle_minutes",
+            "experimental_single_process_spawn",
+            "experimental_shared_decode",
+            "settings_process_isolation",
+        ):
+            if key in raw and raw[key] is not None:
+                self.data[key] = raw[key]
+        if "proactive_screen" in raw:
+            self.data["proactive_screen"] = _merge_proactive_screen_data(raw["proactive_screen"])
+        if "agent_link" in raw:
+            self.data["agent_link"] = _merge_agent_link_data(raw["agent_link"])
+        if "file_interpret" in raw:
+            self.data["file_interpret"] = _merge_file_interpret_data(raw["file_interpret"])
+        self._migrate_click_sound_config(raw)
+        self._migrate_decode_broker_config(raw)
+        self.data["version"] = 4
+        self._migrate_plaintext_keys_to_keyring()
+
+    def _migrate_plaintext_keys_to_keyring(self) -> None:
+        """加载时把磁盘遗留的明文 API Key 迁移进 keyring。
+
+        v4.0.4/4.0.5 起 _redacted_data() 写盘时剔除 chat.providers 下的明文
+        api_key/vision_api_key，但 SecretStore.set 只在设置对话框保存时调用——
+        老版本（≤v4.0.0）磁盘上的明文 key 从未进过 keyring，升级后首次写盘即被剔除，
+        重启后 resolve_api_key 拿不到任何值，聊天/视觉 401 静默失效。
+        此处补迁移：keyring 已有值不覆盖（与 resolve_api_key 的 keyring 优先序一致），
+        仅丢弃明文；set 失败（keyring 不可用）保留内存明文，维持原兜底行为。
+        幂等：迁移成功后内存/磁盘均无明文，重复 reload 无副作用；不主动 save()，
+        写盘剔除交给下次正常保存。
+        """
+        chat = self.data.get("chat")
+        providers = chat.get("providers") if isinstance(chat, dict) else None
+        if not isinstance(providers, dict):
+            return
+        try:
+            from .chat.models import SecretStore  # 惰性导入，且只实例化一次
+        except ModuleNotFoundError as exc:
+            # 无聊天功能的独立打包会明确排除 pet.chat；配置仍可被
+            # 通用入口加载，因此不能让一次迁移检查阻止桌宠启动。
+            if exc.name == "pet.chat" or str(exc.name or "").startswith("pet.chat."):
+                return
+            raise
+        store = SecretStore()
+        for provider_id, provider in providers.items():
+            if not isinstance(provider, dict):
+                continue
+            for key_field, ref_field, default_ref in (
+                ("api_key", "api_key_ref", f"provider/{provider_id}"),
+                ("vision_api_key", "vision_api_key_ref", f"provider/{provider_id}/vision"),
+            ):
+                plaintext = str(provider.get(key_field) or "")
+                if not plaintext.strip():
+                    continue
+                ref = str(provider.get(ref_field) or "").strip()
+                if not ref:
+                    ref = default_ref
+                    provider[ref_field] = ref
+                if store.get(ref) or store.set(ref, plaintext):
+                    provider.pop(key_field, None)
+
+    def _migrate_click_sound_config(self, raw: dict) -> None:
+        """旧版 click_sound_path 迁移为 click_sound_pack。"""
+        # 如果 raw 里面没有明确合法的 click_sound_pack，但有旧 click_sound_path
+        has_explicit_pack = isinstance(raw.get("click_sound_pack"), dict) and bool(raw.get("click_sound_pack", {}).get("kind"))
+        if not has_explicit_pack:
+            old_path = str(raw.get("click_sound_path") or "").strip()
+            if old_path:
+                self.data["click_sound_pack"] = {
+                    "kind": "file",
+                    "id": "custom",
+                    "path": old_path,
+                }
+            else:
+                self.data["click_sound_pack"] = _default_click_sound_pack()
+
+    def _migrate_decode_broker_config(self, raw: dict) -> None:
+        """批5.3：decode_broker_enabled 退役（shm broker 下线，共享解码改由
+        进程内 DecodeFanoutHub 承担）。迁移语义（SETTINGS-CHANGE-GATES）：读旧值
+        → 记一次 info → 忽略（键从 defaults/白名单移除，不再归一/进入 self.data）。"""
+        if getattr(self, "_decode_broker_migrated", False):
+            return
+        if "decode_broker_enabled" in raw:
+            old = raw.get("decode_broker_enabled")
+            logging.getLogger(__name__).info("配置键 decode_broker_enabled 已退役（批5.3 共享解码改为进程内 fan-out），忽略旧值 %r", old)
+            raw.pop("decode_broker_enabled", None)
+        self._decode_broker_migrated = True
+
+    @staticmethod
+    def _clean_phrase_events(events) -> dict:
+        """清洗单层 dialogue 事件映射 {event: list[str] | str}（值上限 8 条/240 字符）。"""
+        if not isinstance(events, dict):
+            return {}
+        cleaned = {}
+        for key, value in events.items():
+            if not str(key).strip():
+                continue
+            if isinstance(value, list):
+                items = [item.strip()[:240] for item in value if isinstance(item, str) and item.strip()]
+                if not items:
+                    continue
+                cleaned[str(key)] = items[:8]
+            elif isinstance(value, str) and value.strip():
+                cleaned[str(key)] = value.strip()[:240]
+        return cleaned
+
+    # dialogue 文案占位符迁移表：旧字段名（链路语义曾错位/曾与协议保留字段撞名）
+    # → 新字段名。加载时幂等替换（新文案不含旧占位符即 no-op），只在用户
+    # 自定义 dialogue_phrases 上执行；内置 preset JSON 直接改源文件。
+    _DIALOGUE_PLACEHOLDER_MIGRATIONS = (
+        ("{source}", "{failureType}"),
+        ("{errorText}", "{errorMessage}"),
+    )
+
+    # 事件键改名表：旧事件键（曾按状态码命名）→ 新语义键。内置 preset JSON 直接
+    # 改源文件；用户自定义 dialogue_phrases 里的旧键在加载时迁移一次（幂等）。
+    # 新键已存在时以新配置为准，丢弃旧键（不合并、不留别名）。
+    _DIALOGUE_EVENT_KEY_MIGRATIONS = (
+        ("rate_limit.one", "model_access.one"),
+        ("rate_limit.many", "model_access.many"),
+    )
+
+    @classmethod
+    def _migrate_dialogue_phrase_fields(cls, phrases) -> None:
+        """迁移 dialogue_phrases（global/agents 各层文案）里的旧事件键与旧占位符。
+
+        先按 ``_DIALOGUE_EVENT_KEY_MIGRATIONS`` 改键，再把 list/str 值里的旧占位符
+        替换为新名（``_DIALOGUE_PLACEHOLDER_MIGRATIONS``）。原地修改；对新配置
+        （无旧键、无旧占位符）幂等无副作用。
+        """
+        if not isinstance(phrases, dict):
+            return
+        stack = [phrases]
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict):
+                continue
+            for old_key, new_key in cls._DIALOGUE_EVENT_KEY_MIGRATIONS:
+                if old_key not in node:
+                    continue
+                if new_key in node:
+                    node.pop(old_key)  # 新配置优先：同名新键已在，丢弃旧键
+                else:
+                    node[new_key] = node.pop(old_key)
+            for key, value in node.items():
+                if isinstance(value, str):
+                    replaced = value
+                    for old, new in cls._DIALOGUE_PLACEHOLDER_MIGRATIONS:
+                        replaced = replaced.replace(old, new)
+                    if replaced != value:
+                        node[key] = replaced
+                elif isinstance(value, list):
+                    for i, item in enumerate(value):
+                        if not isinstance(item, str):
+                            continue
+                        replaced = item
+                        for old, new in cls._DIALOGUE_PLACEHOLDER_MIGRATIONS:
+                            replaced = replaced.replace(old, new)
+                        if replaced != item:
+                            value[i] = replaced
+                elif isinstance(value, dict):
+                    stack.append(value)
+
+    def _normalize_pet_settings(self):
+        dialogue_mode = str(self.data.get("dialogue_mode") or "legacy").lower()
+        self.data["dialogue_mode"] = dialogue_mode if dialogue_mode in {"legacy", "whale_maid", "custom"} else "legacy"
+        raw_phrases = self.data.get("dialogue_phrases")
+        if isinstance(raw_phrases, dict) and ("global" in raw_phrases or "agents" in raw_phrases):
+            # 统一预设双层 {global: events, agents: {agent_key: events}}
+            preset = {}
+            global_events = raw_phrases.get("global")
+            preset["global"] = self._clean_phrase_events(global_events)
+            agents = {}
+            raw_agents = raw_phrases.get("agents")
+            if isinstance(raw_agents, dict):
+                for agent_key, events in raw_agents.items():
+                    agent_cleaned = self._clean_phrase_events(events)
+                    if str(agent_key).strip() and agent_cleaned:
+                        agents[str(agent_key)] = agent_cleaned
+            preset["agents"] = agents
+            self.data["dialogue_phrases"] = preset
+        else:
+            # 旧单层 {event: [...]}：视为 global
+            self.data["dialogue_phrases"] = self._clean_phrase_events(raw_phrases)
+        # 旧占位符迁移（{source}→{failureType} 等；新配置幂等 no-op）
+        self._migrate_dialogue_phrase_fields(self.data.get("dialogue_phrases"))
+        from . import physics as physics_mod
+
+        self.data["playback_speed"] = _float_or_default(self.data.get("playback_speed"), 1.0, 0.1, 8.0)
+        self.data["animation_gap_seconds"] = _float_or_default(self.data.get("animation_gap_seconds"), DEFAULT_ANIMATION_GAP_SECONDS, 0.0, 3600.0)
+        minimum = _float_or_default(self.data.get("self_talk_min_interval"), DEFAULT_SELF_TALK_MIN_INTERVAL, 5.0, 3600.0)
+        maximum = _float_or_default(self.data.get("self_talk_max_interval"), DEFAULT_SELF_TALK_MAX_INTERVAL, 5.0, 3600.0)
+        self.data["self_talk_min_interval"] = min(minimum, maximum)
+        self.data["self_talk_max_interval"] = max(minimum, maximum)
+        self.data["self_talk_duration_seconds"] = _float_or_default(
+            self.data.get("self_talk_duration_seconds"),
+            DEFAULT_SELF_TALK_DURATION_SECONDS,
+            1.0,
+            300.0,
+        )
+        self.data["self_talk_image_dir"] = str(self.data.get("self_talk_image_dir") or "").strip()[:500]
+        self.data["self_talk_image_scale"] = int(_float_or_default(self.data.get("self_talk_image_scale"), 100.0, 50.0, 300.0))
+        self.data["self_talk_image_chance"] = int(_float_or_default(self.data.get("self_talk_image_chance"), float(DEFAULT_SELF_TALK_IMAGE_CHANCE), 0.0, 100.0))
+        self.data["bubble_text_scale"] = int(_float_or_default(self.data.get("bubble_text_scale"), 100.0, 50.0, 300.0))
+        self.data["self_talk_enabled"] = bool(self.data.get("self_talk_enabled", False))
+        self.data["self_talk_speak_enabled"] = _bool_or_default(self.data.get("self_talk_speak_enabled"), True)
+        self.data["self_talk_voice_precache_enabled"] = _bool_or_default(self.data.get("self_talk_voice_precache_enabled"), False)
+        self.data["cursor_hidden_passthrough"] = _bool_or_default(self.data.get("cursor_hidden_passthrough"), True)
+        self.data["spawn_inherit_size"] = _bool_or_default(self.data.get("spawn_inherit_size"), True)
+        self.data["spawn_scale"] = _float_or_default(self.data.get("spawn_scale"), catalog.DEFAULT_SCALE, 0.1, 4.0)
+        self.data["spawn_inherit_dynamic_island"] = _bool_or_default(self.data.get("spawn_inherit_dynamic_island"), False)
+        self.data["show_dock_icon"] = bool(self.data.get("show_dock_icon", True))
+        self.data["self_talk_texts"] = _clean_self_talk_texts(self.data.get("self_talk_texts"))
+        bubble_style = str(self.data.get("self_talk_bubble_style") or "")
+        self.data["self_talk_bubble_style"] = bubble_style if bubble_style in SELF_TALK_BUBBLE_STYLES else DEFAULT_SELF_TALK_BUBBLE_STYLE
+        if self.data.get("context_menu_template") not in {"legacy", "modern"}:
+            self.data["context_menu_template"] = "modern"
+        self.data["context_menu_layout"] = _clean_menu_layout_override(self.data.get("context_menu_layout"))
+        self.data["context_menu_appearance"] = _clean_menu_appearance(self.data.get("context_menu_appearance"))
+        self.data["menu_easter_egg"] = _clean_menu_easter_egg(self.data.get("menu_easter_egg"))
+        self.data["quick_launch_apps"] = _clean_quick_launch_apps(self.data.get("quick_launch_apps"))
+        if self.data.get("chat_ui_style") not in {"modern", "classic"}:
+            self.data["chat_ui_style"] = "modern"
+        self.data["character_profiles"] = _clean_character_profiles(self.data.get("character_profiles"))
+        self.data["chat_always_on_top"] = bool(self.data.get("chat_always_on_top", False))
+        self.data["dynamic_island"] = _clean_dynamic_island_data(self.data.get("dynamic_island"))
+        for prefix in ("chat_background", "modern_chat_background"):
+            opacity_key = f"{prefix}_opacity"
+            fill_key = f"{prefix}_fill"
+            try:
+                opacity = int(self.data.get(opacity_key, 100))
+            except (TypeError, ValueError):
+                opacity = 100
+            self.data[opacity_key] = max(10, min(100, opacity))
+            fill = str(self.data.get(fill_key, "cover") or "cover")
+            self.data[fill_key] = fill if fill in {"cover", "contain", "stretch"} else "cover"
+        try:
+            card_opacity = int(self.data.get("modern_chat_card_opacity", 84))
+        except (TypeError, ValueError):
+            card_opacity = 84
+        self.data["modern_chat_card_opacity"] = max(10, min(100, card_opacity))
+
+        # 点击音效 & 弹弓 & 物理力度归一化
+        self.data["click_sound_enabled"] = bool(self.data.get("click_sound_enabled", True))
+        self.data["click_sound_pack"] = _clean_click_sound_pack(self.data.get("click_sound_pack"))
+        self.data["click_sound_volume"] = _float_or_default(self.data.get("click_sound_volume"), 0.70, 0.0, 1.0)
+        self.data["slingshot_enabled"] = bool(self.data.get("slingshot_enabled", True))
+        strength = physics_mod.normalize_throw_strength(str(self.data.get("throw_strength") or "standard"))
+        self.data["throw_strength"] = strength
+        # 闲置降帧（性能调研 §4.3）：开关默认关（灰度）；阈值夹到 [1, 3600] 秒
+        # 终审 P1-3：必须用 _bool_or_default——bool("false") is True，字符串
+        # 布尔（外部手改配置/旧版导出）会被误开；与其它布尔键同规。
+        self.data["idle_low_fps_enabled"] = _bool_or_default(self.data.get("idle_low_fps_enabled"), False)
+        self.data["idle_low_fps_threshold"] = _float_or_default(self.data.get("idle_low_fps_threshold"), 30.0, 1.0, 3600.0)
+        # 上游 #60 系统通知开关：同规防字符串布尔误开（bool("false") is True）。
+        self.data["system_notifications_enabled"] = _bool_or_default(self.data.get("system_notifications_enabled"), True)
+        # 待办提醒：开关同规防字符串布尔误开；提前量钳到 [0, 60] 分钟（0=不提前）。
+        self.data["todo_reminder_enabled"] = _bool_or_default(self.data.get("todo_reminder_enabled"), True)
+        self.data["todo_reminder_lead_minutes"] = int(_float_or_default(self.data.get("todo_reminder_lead_minutes"), 5.0, 0.0, 60.0))
+        # 黄金回旋 / 边缘探头：与其它布尔键同规，防手改字符串布尔误开。
+        self.data["golden_spin_on_click"] = _bool_or_default(self.data.get("golden_spin_on_click"), False)
+        self.data["golden_spin_direct"] = _bool_or_default(self.data.get("golden_spin_direct"), False)
+        self.data["edge_probe_enabled"] = _bool_or_default(self.data.get("edge_probe_enabled"), False)
+        self.data["agent_link"] = _clean_agent_link_data(self.data.get("agent_link"))
+        # 音乐关联 / 消费统计（#129 新增的 5 键）：此前只在默认值与 reload 白名单
+        # 里登记、没进归一化——手改成脏值后数值键会让设置页构造直接抛
+        # ValueError（float('abc') 打死整个设置页），字符串布尔键被 bool() 误开
+        # （bool('false') is True，歌词功能自己打开）。布尔走 _bool_or_default、
+        # 数值夹回消费端可用区间，与其它键同规。
+        self.data["music_lyric_enabled"] = _bool_or_default(self.data.get("music_lyric_enabled"), False)
+        self.data["agent_cost_enabled"] = _bool_or_default(self.data.get("agent_cost_enabled"), False)
+        # 唱歌动画检测开关：同族漏网的第六个键（交付前审查 P2-b）——字符串
+        # "false" 被 bool() 判真，用户明确关掉的开关会自己打开，与上面两键同规。
+        self.data["music_sing_enabled"] = _bool_or_default(self.data.get("music_sing_enabled"), False)
+        # 持续静音判定时长：下限 1s（低于它就退回"瞬时静音即退出"的老问题），
+        # 上限必须有——否则手改 1e9 会让唱歌状态永不退出。
+        self.data["music_sing_grace_seconds"] = _float_or_default(
+            self.data.get("music_sing_grace_seconds"), 6.0, 1.0, 3600.0
+        )
+        # 歌词提前量的区间与设置页滑块**同源**（music_lyric_controller 的常量），
+        # 不再抄一份边界。惰性导入：config.py 顶层不引 Qt。
+        from .music_lyric_controller import (
+            LEAD_MAX_SECONDS,
+            LEAD_MIN_SECONDS,
+            LYRIC_LEAD_SECONDS,
+        )
+        self.data["music_lyric_lead_seconds"] = _float_or_default(
+            self.data.get("music_lyric_lead_seconds"),
+            LYRIC_LEAD_SECONDS,
+            LEAD_MIN_SECONDS,
+            LEAD_MAX_SECONDS,
+        )
+        # 歌词缓存条数上限：非数值回落默认（music_lyric.CACHE_LIMIT），
+        # 负数/0 无意义，夹到至少 1 条。消费方是 music_lyric_controller 的取词
+        # 线程（fetch_lyrics(cache_limit=...) → _prune_cache），不是摆设。
+        self.data["music_lyric_cache_limit"] = int(
+            _float_or_default(self.data.get("music_lyric_cache_limit"), 2000.0, 1.0, 100000.0)
+        )
+        # 手动播放器路径：此前只有消费方读、没有 schema 登记，手改 config.json 会
+        # 被 reload() 静默丢弃（交付前审查 P1-3）。清洗成 {netease|qqmusic: 路径}。
+        self.data["music_player_paths"] = _clean_music_player_paths(self.data.get("music_player_paths"))
+        prewarm = str(self.data.get("media_prewarm", "balanced") or "balanced").strip().lower()
+        self.data["media_prewarm"] = prewarm if prewarm in {"full", "balanced", "minimal"} else "balanced"
+        # 批10-A3：默认 32→8（预测式预热使能）；32 是批9 引入仅一天的旧默认，
+        # 视为遗留值一并迁移（想调大可设 16/64 等非 32 值，32 本身被保留为迁移哨兵）。
+        _ffb = _float_or_default(self.data.get("first_frame_cache_max_mb"), 8, 4, 64)
+        self.data["first_frame_cache_max_mb"] = 8 if int(_ffb) == 32 else int(_ffb)
+        # 批10-A1 预测式预热提前量：夹到 [200, 600] 毫秒（默认 350）。
+        self.data["predict_prewarm_lead_ms"] = int(_float_or_default(self.data.get("predict_prewarm_lead_ms"), 350, 200, 600))
+        # 批11-B1：ffmpeg 圈边界回收阈值（分钟）。0 = 关闭回收；否则夹到
+        # [2, 120]（默认 10）。
+        _ffr = _float_or_default(self.data.get("ffmpeg_recycle_minutes"), 10, 0, 120)
+        self.data["ffmpeg_recycle_minutes"] = 0 if _ffr <= 0 else int(max(2.0, _ffr))
+        # 批5.2 spike 开关：同其它布尔键规约，防字符串布尔误开。
+        self.data["experimental_single_process_spawn"] = _bool_or_default(self.data.get("experimental_single_process_spawn"), False)
+        # 批5.3 共享解码链开关：同规防字符串布尔误开（默认开）。
+        self.data["experimental_shared_decode"] = _bool_or_default(self.data.get("experimental_shared_decode"), True)
+        # 设置页进程隔离：同规防字符串布尔误开；默认开（关掉 = 回退进程内设置页）。
+        self.data["settings_process_isolation"] = _bool_or_default(self.data.get("settings_process_isolation"), True)
+        # 拖文件解读（file_interpret）：嵌套键归一化（布尔/秒数钳制），
+        # 未认识的键随 _merge_file_interpret_data 保留（对齐 agent_link 宽容策略）
+        fi = self.data.get("file_interpret")
+        if isinstance(fi, dict):
+            fi["enabled"] = _bool_or_default(fi.get("enabled", True), True)
+            fi["progress_interval_seconds"] = _float_or_default(
+                fi.get("progress_interval_seconds"), 15.0, 5.0, 120.0
+            )
+        self.data.update(_clean_collision_data(self.data))
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def character_alias(self, character_id: str) -> str:
+        """用户自定义的角色显示名；未设置返回空串。"""
+        aliases = self.data.get("character_aliases")
+        if isinstance(aliases, dict):
+            return str(aliases.get(character_id, "") or "").strip()
+        return ""
+
+    def set_character_alias(self, character_id: str, name: str) -> None:
+        """设置角色显示名别名（最长 24 字符）；空名表示恢复默认。"""
+        aliases = self.data.setdefault("character_aliases", {})
+        if not isinstance(aliases, dict):
+            aliases = {}
+            self.data["character_aliases"] = aliases
+        name = (name or "").strip()[:24]
+        if name:
+            aliases[character_id] = name
+        else:
+            aliases.pop(character_id, None)
+        self.save()
+
+    def character_display_name(self, character_id: str) -> str:
+        """角色显示名：用户别名优先，未设置回退目录显示名（manifest name/角色 id）。
+
+        展示给用户或注入 AI 提示（如识屏自我识别）的场合一律走本方法，
+        不要直取 catalog.character_display_name 而绕过用户重命名。
+        """
+        return self.character_alias(character_id) or catalog.character_display_name(character_id)
+
+    def character_profile(self, character_id: str) -> dict:
+        """返回角色档案；不存在时返回空档案。"""
+        profiles = self.data.get("character_profiles")
+        if isinstance(profiles, dict):
+            profile = profiles.get(str(character_id))
+            if isinstance(profile, dict):
+                return profile
+        return {}
+
+    def click_talk_bindings(self, character_id: str) -> dict:
+        """返回某角色的点击动画台词绑定：{动画id: [台词, ...]}。"""
+        profile = self.character_profile(character_id)
+        bindings = profile.get("click_talk_bindings")
+        return bindings if isinstance(bindings, dict) else {}
+
+    def click_talk_texts_for(self, character_id: str, action_id: str) -> list[str]:
+        """返回某点击动画绑定的台词；未绑定返回空列表。"""
+        bindings = self.click_talk_bindings(character_id)
+        texts = bindings.get(str(action_id))
+        return texts if isinstance(texts, list) else []
+
+    def set_click_talk_bindings(self, character_id: str, bindings: dict) -> None:
+        """保存某角色的点击动画台词绑定并立即落盘。"""
+        profiles = self.data.setdefault("character_profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+            self.data["character_profiles"] = profiles
+        profile = profiles.setdefault(str(character_id), {})
+        if not isinstance(profile, dict):
+            profile = {}
+            profiles[str(character_id)] = profile
+        profile["click_talk_bindings"] = bindings
+        self.data["character_profiles"] = _clean_character_profiles(profiles)
+        self.save()
+
+    def set(self, key, value):
+        self.data[key] = value
+        if key in {
+            "playback_speed",
+            "animation_gap_seconds",
+            "self_talk_enabled",
+            "self_talk_min_interval",
+            "self_talk_max_interval",
+            "self_talk_texts",
+            "self_talk_duration_seconds",
+            "self_talk_image_dir",
+            "self_talk_image_scale",
+            "self_talk_image_chance",
+            "bubble_text_scale",
+            "self_talk_bubble_style",
+            "self_talk_voice_precache_enabled",
+            "context_menu_appearance",
+            "context_menu_layout",
+            "quick_launch_apps",
+            "menu_easter_egg",
+            "click_sound_enabled",
+            "click_sound_pack",
+            "click_sound_volume",
+            "collision_sound_enabled",
+            "collision_sound_volume",
+            "slingshot_enabled",
+            "throw_strength",
+            "agent_link",
+            "file_interpret",
+            "idle_low_fps_enabled",
+            "idle_low_fps_threshold",
+            "media_prewarm",
+            "first_frame_cache_max_mb",
+            "predict_prewarm_lead_ms",
+            "ffmpeg_recycle_minutes",
+            "spawn_inherit_size",
+            "spawn_scale",
+            "spawn_inherit_dynamic_island",
+            "todo_reminder_enabled",
+            "todo_reminder_lead_minutes",
+            "music_sing_enabled",
+            "music_sing_grace_seconds",
+            "music_lyric_enabled",
+            "music_lyric_lead_seconds",
+            "music_lyric_cache_limit",
+            "agent_cost_enabled",
+            "music_player_paths",
+            "character_profiles",
+            "chat_always_on_top",
+            "dynamic_island",
+        }:
+            self._normalize_pet_settings()
+
+    def chat_settings(self):
+        from .chat.models import ChatSettings
+
+        return ChatSettings.from_dict(self.data.get("chat", {}))
+
+    def set_chat_settings(self, settings):
+        self.data["chat"] = settings.to_dict(include_secrets=True)
+
+    # ---- 域 facade 便捷入口（批5：只建不用，调用点未迁移）----
+    # 返回对应域的轻量视图（pet/config_domains.py）。normalize 复用本模块现有
+    # _merge_*/_clean_* 函数；facade 只读，不写盘、不碰 secret 保留/version 迁移。
+    def chat_config(self):
+        from .config_domains import ChatConfig
+
+        return ChatConfig.from_dict(self.data.get("chat", {}))
+
+    def agent_link_config(self):
+        from .config_domains import AgentLinkConfig
+
+        return AgentLinkConfig.from_dict(self.data.get("agent_link", {}))
+
+    def proactive_config(self):
+        from .config_domains import ProactiveConfig
+
+        return ProactiveConfig.from_dict(self.data.get("proactive_screen", {}))
+
+    def collision_config(self):
+        from .config_domains import CollisionConfig
+
+        return CollisionConfig.from_dict(self.data)
+
+    def menu_config(self):
+        from .config_domains import MenuConfig
+
+        return MenuConfig.from_dict(self.data)
+
+    def resolve_api_key(self, provider):
+        from .chat.models import SecretStore
+
+        return SecretStore().get(provider.api_key_ref) or provider.api_key
+
+    def _redacted_data(self) -> dict:
+        """深拷贝待写盘数据，并剔除 chat.providers 下的明文 API Key。
+
+        keyring 不可用时（SecretStore.set 返回 False）设置对话框会把 key 放进
+        provider.api_key / vision_api_key 供本次运行使用；写盘时必须剔除，
+        避免明文落盘——key 只保留在内存（self.data），重启需重输。
+        """
+        write_data = copy.deepcopy(self.data)
+        chat = write_data.get("chat")
+        if isinstance(chat, dict):
+            providers = chat.get("providers")
+            if isinstance(providers, dict):
+                for provider in providers.values():
+                    if isinstance(provider, dict):
+                        provider.pop("api_key", None)
+                        provider.pop("vision_api_key", None)
+        return write_data
+
+    def save(self) -> bool:
+        """把配置写入磁盘；成功返回 True，失败返回 False（并记录 warning）。
+
+        写盘使用 _redacted_data() 的副本，self.data 本身不动，保证运行期
+        key 在内存可见而不会明文落盘。
+        临时文件名加入 PID 后缀，避免错误并发写入撞名。
+        """
+        try:
+            self._normalize_pet_settings()
+            self.dir.mkdir(parents=True, exist_ok=True)
+            temp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+            temp.write_text(
+                json.dumps(self._redacted_data(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temp, self.path)
+        except OSError as exc:
+            logging.warning("保存配置失败: %s (%s)", self.path, exc)
+            return False
+        return True
