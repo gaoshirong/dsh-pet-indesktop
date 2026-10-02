@@ -151,7 +151,21 @@ function Force-PetConfigFlags([string]$Executable) {
   # before every launch (idempotent).
   try {
     $configPath = Join-Path $env:APPDATA "$(Get-PetConfigDirectoryName $Executable)\config.json"
-    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { return }
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
+      # 首次运行（新电脑装完第一次启动）：桌宠还没生成 config.json。
+      # 它的默认值是 show_dock_icon=True，而原实现此处直接 return —— 结果第一次
+      # 启动会冒出托盘图标，要等第二次启动才被本函数修正（实测症状："新电脑装完
+      # 桌宠图标出现在托盘里"）。因此这里先建一份**只带该标志的最小配置**；
+      # 桌宠加载时会用默认值补齐其余键，所以只写这两个键是安全的。
+      try {
+        $dir = Split-Path -Parent $configPath
+        if (-not (Test-Path -LiteralPath $dir)) {
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+        Write-JsonAtomic $configPath ([ordered]@{ version = 4; show_dock_icon = $false })
+      } catch {}
+      return
+    }
     $config = Read-JsonObject $configPath
     if ($null -eq $config) { return }
     $current = $null

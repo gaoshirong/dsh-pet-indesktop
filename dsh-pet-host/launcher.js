@@ -187,7 +187,17 @@ function disableOldPetTrayIcon(executable) {
     if (!appData) return;
     const configPath = path.join(appData, petConfigDirName(executable), "config.json");
     if (!fs.existsSync(configPath)) {
-      diag("未找到桌宠配置，跳过托盘图标处理：", configPath);
+      // 首次运行（新电脑第一次启动）：桌宠还没生成 config.json，而它的默认值是
+      // show_dock_icon=true。原实现此处直接 return，于是第一次启动会冒出托盘图标，
+      // 要等第二次才被修掉（实测症状："装到新电脑后桌宠图标出现在托盘里"）。
+      // 这里先播种一份最小配置；桌宠加载时会补齐其余默认键。
+      try {
+        fs.mkdirSync(path.dirname(configPath), { recursive: true });
+        fs.writeFileSync(configPath, JSON.stringify({ version: 4, show_dock_icon: false }, null, 2), "utf8");
+        diag("首次运行：已播种配置以关闭托盘图标：", configPath);
+      } catch (error) {
+        diag("播种配置失败：", error?.message ?? String(error));
+      }
       return;
     }
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
