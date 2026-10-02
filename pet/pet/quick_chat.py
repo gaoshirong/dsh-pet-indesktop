@@ -517,7 +517,9 @@ class QuickChatBubble(QFrame):
         QTimer.singleShot(180, self._begin_region_select)
         # 兜底：万一覆盖层既没发 selected 也没发 cancelled（被系统关掉、
         # 或事件没派发到），也必须把气泡放回来——否则桌宠/气泡会一直不显示。
-        QTimer.singleShot(self._CAPTURE_WATCHDOG_MS, self._capture_watchdog)
+        # 注意 `_CAPTURE_WATCHDOG_MS` 是**模块级常量**，不能写成 self. 引用
+        # （写成 self. 会抛 AttributeError，导致点击"截图"直接报错）。
+        QTimer.singleShot(_CAPTURE_WATCHDOG_MS, self._capture_watchdog)
 
     def _begin_region_select(self) -> None:
         # 覆盖层自己持有引用，信号回调里通过闭包取回裁切结果

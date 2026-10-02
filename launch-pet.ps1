@@ -96,17 +96,26 @@ function Resolve-PetPython {
     }
   }
   # 系统 PATH 里的 Python（用户自己装的那份）。
-  # ⚠️ 只认 pythonw.exe：Windows 的 Microsoft Store 会给 python.exe / python3.exe
-  # 放一个"假解释器"占位程序（运行只提示去商店安装），它没有同目录的 pythonw.exe，
-  # 用它当解释器会直接失败。优先 pythonw 天然避开这个坑。
+  #
+  # ⚠️ 判断"是不是真解释器"**绝不能用 `& python --version` 去试**：
+  # Windows 的 Microsoft Store 会给 python.exe / python3.exe 放一个"假解释器"
+  # 占位程序，它往 **stderr** 写 "Python was not found..."；而本脚本开头设了
+  # `$ErrorActionPreference = "Stop"`，PowerShell 会把这条原生命令的 stderr
+  # 当成**致命错误**，直接终止整个启动器——实测症状："桌宠完全不启动，
+  # 宿主日志报 code=1，运行 5s"，而且启动器自己的 trace 也停在更早的位置。
+  #
+  # 改用**纯文件系统判断**：占位程序只有 python.exe / python3.exe，
+  # **没有同目录的 pythonw.exe**。存在 pythonw.exe 就当它是真 Python。
   foreach ($exeName in @("pythonw.exe", "python.exe")) {
     $found = Get-Command $exeName -ErrorAction SilentlyContinue
     if (-not $found) { continue }
-    if (-not (Test-Path -LiteralPath $found.Source -PathType Leaf)) { continue }
-    # 校验它真的是 Python（Store 占位程序不带 pythonw.exe，且 --version 会失败）
-    $probe = & $found.Source --version 2>&1 | Out-String
-    if ($probe -notmatch 'Python\s+3') { continue }
-    $candidates += $found.Source
+    $resolvedSource = $found.Source
+    if (-not $resolvedSource) { continue }
+    if (-not (Test-Path -LiteralPath $resolvedSource -PathType Leaf)) { continue }
+    $dir = Split-Path -Parent $resolvedSource
+    $windowed = Join-Path $dir "pythonw.exe"
+    if (-not (Test-Path -LiteralPath $windowed -PathType Leaf)) { continue }
+    $candidates += $windowed
   }
 
   foreach ($candidate in $candidates) {
