@@ -205,6 +205,35 @@ _FFMPEG_INPUT_PARAMS = [
     '-threads', '1',
 ]
 
+#: alpha 兜底阈值：低于它的像素视为完全透明。
+#:
+#: 背景（实测 2026-10-02，idle 片段 640x360 采样）：画布 **81.8% 的像素是
+#: alpha=1**（≈0.4% 不透明）而不是 0，alpha=0 只占 0.6%，角色本体（>=128）
+#: 占 16.8%。Windows 上桌宠**刻意不用 setMask**（1-bit 裁剪会破坏柔和边缘），
+#: 透明区完全依赖帧自身的 alpha——于是这片"1 而不是 0"的雾让窗口被 DWM
+#: 判定为不透明窗口，在桌宠周围画出一圈**矩形阴影**（长期反馈："桌宠周围
+#: 一直有个阴影方框"；与 DSH 接入无关，属上游固有行为）。
+#: 归零后该区域真正透明，阴影消失；角色柔边（alpha>=8）原样保留。
+_HAZE_ALPHA_MAX = 8
+_HAZE_ALPHA_TABLE = bytes([0] * _HAZE_ALPHA_MAX + list(range(_HAZE_ALPHA_MAX, 256)))
+
+
+def _zero_haze_alpha(frame):
+    """把近乎为零的 alpha（< _HAZE_ALPHA_MAX）归零，消除窗口矩形阴影。
+
+    性能：`bytes.translate` 与步长切片都是 C 实现，每帧只多三次 C 级操作
+    （640x360 = 92 万字节），不构成瓶颈；不引入 numpy 依赖。
+    """
+    if not frame:
+        return frame
+    try:
+        buf = bytearray(frame)
+        buf[3::4] = bytes(buf[3::4]).translate(_HAZE_ALPHA_TABLE)
+        return bytes(buf)
+    except Exception:  # noqa: BLE001 - 兜底失败不能影响播放
+        return frame
+
+
 # ------------------------------------------------------------ 会话结束（关机/注销）spawn 闸门（issue #111）
 # 现象：Windows 关机/注销时必弹「ffmpeg-*.exe - 应用程序无法正常启动
 # (0xc0000142)」并阻塞关机流程。
@@ -1851,7 +1880,10 @@ class WebMClip(QObject):
                 self._frame_count = int(round(self._fps * self._duration))
             expect = self._w * self._h * self._bpp
             if len(frame) == expect:
-                img = QImage(frame, self._w, self._h, self._w * self._bpp,
+                # 用局部变量持有归零后的字节：QImage 不拷贝缓冲区，直接把临时对象
+                # 传进去会有悬空指针风险（与原代码 frame 同生命周期，故安全）。
+                frame_rgba = _zero_haze_alpha(frame)
+                img = QImage(frame_rgba, self._w, self._h, self._w * self._bpp,
                              QImage.Format.Format_RGBA8888)
                 if not img.isNull():
                     return img.copy()
@@ -2599,7 +2631,9 @@ class WebMClip(QObject):
             return
         if perfstats.ENABLED:
             _cons_t0 = perfstats.clock()
-        img = QImage(data, self._w, self._h, self._w * self._bpp,
+        # 局部变量持有：QImage 不拷贝缓冲区，直接传临时对象会有悬空指针风险。
+        frame_rgba = _zero_haze_alpha(data)
+        img = QImage(frame_rgba, self._w, self._h, self._w * self._bpp,
                      QImage.Format.Format_RGBA8888)
         if img.isNull():
             return
