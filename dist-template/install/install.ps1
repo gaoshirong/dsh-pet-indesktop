@@ -45,9 +45,26 @@ Info "安装位置 : $Target"
 Info "DSH profile : $Profile"
 
 # --- 1. 前置检查 ---
-$profileDir = Join-Path $env:USERPROFILE ".dsh\profiles\$Profile"
+# DSH 家目录：**必须尊重 DSH_HOME**。用户可能把家目录迁到别的盘
+# （例如 DSH_HOME=D:\DSH\home 以避免占用 C 盘），写死 %USERPROFILE%\.dsh
+# 会把插件装到 DSH 根本不读的位置。
+$dshHome = if ($env:DSH_HOME -and $env:DSH_HOME.Trim()) {
+    [IO.Path]::GetFullPath($env:DSH_HOME)
+} else {
+    Join-Path $env:USERPROFILE ".dsh"
+}
+Info "DSH 家目录 : $dshHome"
+$profileDir = Join-Path $dshHome "profiles\$Profile"
 if (-not (Test-Path $profileDir)) {
-    Fail "找不到 DSH profile: $profileDir`n      请先安装并至少运行一次 DSH。"
+    # 家目录迁移过、或 profile 名不同：回退到传统位置，避免直接失败
+    $legacyProfile = Join-Path $env:USERPROFILE ".dsh\profiles\$Profile"
+    if (Test-Path $legacyProfile) {
+        Warn "DSH_HOME 指向的 profile 不存在，回退到 $legacyProfile"
+        $dshHome = Join-Path $env:USERPROFILE ".dsh"
+        $profileDir = $legacyProfile
+    } else {
+        Fail "找不到 DSH profile: $profileDir`n      请先安装并至少运行一次 DSH（或检查 DSH_HOME）。"
+    }
 }
 $profilePkg = Join-Path $profileDir "package.json"
 if (-not (Test-Path $profilePkg)) { Fail "找不到 profile 的 package.json: $profilePkg" }
@@ -127,9 +144,18 @@ if (Test-Path $requirements) {
 
     if ($pythonExe) {
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-        $pythonPointer = Join-Path $env:USERPROFILE ".dsh\dsh-pet-python.txt"
-        [System.IO.File]::WriteAllText($pythonPointer, $pythonExe, $utf8NoBom)
-        Ok "已记录解释器路径: $pythonPointer"
+        # 写两处：DSH_HOME 指向的家目录（权威）+ 传统 ~\.dsh（兼容）。
+        # 启动器两处都会读，所以即使用户之后改了 DSH_HOME 也还能找到解释器。
+        foreach ($dir in @($dshHome, (Join-Path $env:USERPROFILE ".dsh")) | Select-Object -Unique) {
+            try {
+                if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+                $pythonPointer = Join-Path $dir "dsh-pet-python.txt"
+                [System.IO.File]::WriteAllText($pythonPointer, $pythonExe, $utf8NoBom)
+                Ok "已记录解释器路径: $pythonPointer"
+            } catch {
+                Warn "写入 $dir 失败：$($_.Exception.Message)"
+            }
+        }
     }
 } else {
     Info "未找到 pet\requirements.txt（可能是 frozen 版），跳过 Python 环境准备"
@@ -216,7 +242,6 @@ if ($bundles -contains $bundleName) {
 }
 
 # --- 6. 记录安装位置，供插件解析桌宠路径 ---
-$pointer = Join-Path $env:USERPROFILE ".dsh\dsh-pet-install.json"
 $docs = [ordered]@{
     schemaVersion = 1
     installedAt   = (Get-Date).ToUniversalTime().ToString("o")
@@ -225,9 +250,57 @@ $docs = [ordered]@{
     petSource     = (Join-Path $Target "pet")
     pythonExe     = $(if ($pythonExe) { $pythonExe } else { "" })
 }
-$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($pointer, ($docs | ConvertTo-Json -Depth 6), $utf8NoBom)
-Ok "已写入安装信息: $pointer"
+# 与解释器指针同理：写两处，兼容 DSH_HOME 与传统位置
+foreach ($dir in @($dshHome, (Join-Path $env:USERPROFILE ".dsh")) | Select-Object -Unique) {
+    try {
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $pointer = Join-Path $dir "dsh-pet-install.json"
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($pointer, ($docs | ConvertTo-Json -Depth 6), $utf8NoBom)
+        Ok "已写入安装信息: $pointer"
+    } catch {
+        Warn "写入 $dir 失败：$($_.Exception.Message)"
+    }
+}
+
+# --- 7. 桌宠数据目录：%APPDATA% 写不进去时改到安装目录 ---
+#
+# 为什么需要：桌宠要把 config.json、会话、槽位锁写在 %APPDATA%\dsh-pet-standalone-webm-chat。
+# 某些机器（含开发机）那个位置**可读不可写**（O_RDWR/O_CREAT 被拒），桌宠会以
+#「当前 128 个槽位中未找到可用空闲槽位」启动失败——排查半天才发现是写权限。
+# 这里先实测可写性，不可写就把安装目录下的 pet-data 通过 junction 挂过去。
+$petDataName = "dsh-pet-standalone-webm-chat"
+$petDataDir = Join-Path $env:APPDATA $petDataName
+$petDataLocal = Join-Path $Target "pet-data"
+$appDataWritable = $false
+try {
+    if (-not (Test-Path $petDataDir)) { New-Item -ItemType Directory -Path $petDataDir -Force | Out-Null }
+    $probe = Join-Path $petDataDir ".write-probe"
+    [System.IO.File]::WriteAllText($probe, "probe")
+    Remove-Item $probe -Force -ErrorAction SilentlyContinue
+    $appDataWritable = $true
+    Ok "桌宠数据目录可写: $petDataDir"
+} catch {
+    $appDataWritable = $false
+}
+
+if (-not $appDataWritable) {
+    Warn "%APPDATA% 下不可写，桌宠数据目录改到安装位置（junction）"
+    try {
+        New-Item -ItemType Directory -Path $petDataLocal -Force | Out-Null
+        # 已有同名真实目录就先搬走内容，再替换成 junction
+        if (Test-Path $petDataDir) {
+            Get-ChildItem -LiteralPath $petDataDir -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $petDataLocal -Recurse -Force -ErrorAction SilentlyContinue }
+            Remove-Item -LiteralPath $petDataDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Junction -Path $petDataDir -Target $petDataLocal -ErrorAction Stop | Out-Null
+        Ok "已建立 junction: $petDataDir -> $petDataLocal"
+    } catch {
+        Warn "建立 junction 失败：$($_.Exception.Message)"
+        Warn "若桌宠报「槽位不足」，请手动把 $petDataDir 指到可写位置"
+    }
+}
 
 Write-Host "`n=== 完成 ===" -ForegroundColor Cyan
 Info "请**重启 DSH** 使插件生效。"
